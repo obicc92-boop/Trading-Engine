@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 221 59% 5%;
+  --foreground: 210 20% 97%;
+  --card: 220 41% 8%;
+  --border: 212 25% 18%;
+  --muted: 217 18% 60%;
+  --accent: 176 92% 74%;
+  --positive: 160 84% 39%;
+  --negative: 348 83% 57%;
+  --font-display: "Aptos", "Segoe UI", "Trebuchet MS", sans-serif;
+  --font-mono: "Cascadia Code", "Consolas", "SFMono-Regular", monospace;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+}
+
+::selection {
+  background: rgba(130, 248, 233, 0.22);
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
