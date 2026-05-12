@@ -65,7 +65,11 @@ class TradingEngine:
 
     def __post_init__(self) -> None:
         self.bybit_service = BybitService(config=self.config, logger=self.logger)
-        self.data_service = MarketDataService(bybit_service=self.bybit_service, logger=self.logger)
+        self.data_service = MarketDataService(
+            config=self.config,
+            bybit_service=self.bybit_service,
+            logger=self.logger,
+        )
         self.risk_manager = RiskManager(
             risk_per_trade=self.config.risk_per_trade,
             daily_loss_limit=self.config.daily_loss_limit,
@@ -118,6 +122,7 @@ class TradingEngine:
             self.config.bybit_use_testnet,
             ",".join(self.config.traded_symbols),
         )
+        self.logger.info("Using %s market data provider.", self.config.market_data_provider)
         self._poll_telegram_updates()
         while True:
             started_at = time.monotonic()

@@ -12,7 +12,8 @@ Private trading assistant for disciplined crypto decision support on Bybit spot 
 
 ## Current Scope
 
-- Bybit V5 spot integration
+- Binance public spot market data for signal candles
+- Bybit V5 spot integration for optional future live execution
 - Testnet-first operation
 - Paper trading mode with simulated fills, spot fees, slippage, and PnL tracking
 - Automatic paper entries once a setup clears the risk filters
@@ -56,8 +57,8 @@ Private trading assistant for disciplined crypto decision support on Bybit spot 
 
 ## Backend Modules
 
-- `engine/services/bybit_service.py`: Bybit V5 REST client for klines, tickers, wallet balance, spot order placement, and order status lookup
-- `engine/data/market_data.py`: normalizes Bybit OHLCV into pandas data frames
+- `engine/data/market_data.py`: fetches and normalizes Binance public OHLCV by default, with a Bybit fallback option
+- `engine/services/bybit_service.py`: Bybit V5 REST client for tickers, wallet balance, spot order placement, and order status lookup
 - `engine/indicators/technical.py`: EMA20, MA50, MA200, RSI(14), ATR, ADX, breakout levels, and volume context
 - `engine/strategies/trend_rsi.py`: higher-timeframe trend filter, breakout vs pullback entries, regime detection, and symbol-strength ranking
 - `engine/risk/manager.py`: confidence gating, volatility filtering, higher-timeframe alignment, improved stop placement, and adaptive target planning
@@ -144,6 +145,8 @@ npm run dev
 ```env
 BYBIT_API_KEY=
 BYBIT_API_SECRET=
+MARKET_DATA_PROVIDER=binance
+BINANCE_BASE_URL=https://data-api.binance.vision
 BYBIT_USE_TESTNET=true
 BYBIT_BASE_URL=https://api-testnet.bybit.com
 BYBIT_ACCOUNT_TYPE=UNIFIED
@@ -221,7 +224,7 @@ NEXT_PUBLIC_DEFAULT_CHART_SYMBOL=BYBIT:BTCUSDT
 
 ## Operational Note
 
-As of May 8, 2026, Bybit's official V5 integration guide states that IP addresses located in the United States may be restricted and can return `403 Forbidden`. If you are operating from the US, verify your legal and technical access path before relying on direct Bybit API connectivity.
+As of May 8, 2026, Bybit's official V5 integration guide states that IP addresses located in the United States may be restricted and can return `403 Forbidden`. The engine uses Binance public market data by default so paper-mode signal generation does not depend on Bybit market-data access from the host. Verify legal and technical access before enabling any Bybit live execution flow.
 
 ## Validation Status
 

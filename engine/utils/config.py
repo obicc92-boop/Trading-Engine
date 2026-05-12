@@ -34,6 +34,8 @@ def _get_env(name: str, default: str | None = None, required: bool = False) -> s
 
 @dataclass(slots=True)
 class AppConfig:
+    market_data_provider: str
+    binance_base_url: str
     bybit_api_key: str | None
     bybit_api_secret: str | None
     bybit_use_testnet: bool
@@ -91,6 +93,10 @@ class AppConfig:
 def load_config() -> AppConfig:
     load_dotenv()
 
+    market_data_provider = (_get_env("MARKET_DATA_PROVIDER", "binance") or "binance").strip().lower()
+    if market_data_provider not in {"binance", "bybit"}:
+        raise ValueError("MARKET_DATA_PROVIDER must be one of ['binance', 'bybit'].")
+
     traded_symbols = _split_csv(os.getenv("TRADED_SYMBOLS")) or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     market_intervals = _split_csv(os.getenv("MARKET_INTERVALS")) or ["1m", "5m", "15m", "1h"]
     unsupported_intervals = set(market_intervals) - SUPPORTED_INTERVALS
@@ -114,6 +120,8 @@ def load_config() -> AppConfig:
     ) or "https://api-testnet.bybit.com"
 
     config = AppConfig(
+        market_data_provider=market_data_provider,
+        binance_base_url=(_get_env("BINANCE_BASE_URL", "https://data-api.binance.vision") or "https://data-api.binance.vision").rstrip("/"),
         bybit_api_key=_get_env("BYBIT_API_KEY"),
         bybit_api_secret=_get_env("BYBIT_API_SECRET"),
         bybit_use_testnet=bybit_use_testnet,
