@@ -287,3 +287,79 @@ def test_scan_produces_rows_for_everything_considered(engine):
     rows = engine.snapshot()["scan"]
     assert rows
     assert all("regime" in row and "score" in row for row in rows)
+
+
+# -- scan cadence ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("interval,expected_scans", [(1, 5), (2, 3), (5, 1)])
+def test_scan_interval_is_honoured(engine, interval, expected_scans):
+    """An interval of 1 must mean *every* cycle.
+
+    The natural-looking `cycle % interval == 1` is false for every integer when interval
+    is 1, which silently stops the engine from ever scanning again after the first cycle.
+    """
+    engine.config.scan_every_cycles = interval
+    scans = []
+    engine.hunt = lambda: scans.append(engine._cycle)
+
+    for _ in range(5):
+        engine.cycle()
+
+    assert len(scans) == expected_scans
+    assert scans[0] == 1        # always scan on the first cycle after a restart
+
+
+# -- account aggregates ------------------------------------------------------------------
+
+def test_entries_today_counts_open_and_closed_trades_alike(engine):
+    """The daily cap is about how many times I pulled the trigger.
+
+    Whether a trade has finished yet is irrelevant — counting only closed ones would let
+    three open positions be followed by three more entries on the same day.
+    """
+    approve(engine)
+    engine._consider(make_candidate(engine, "BTCEUR"), engine.account_state())
+    assert engine.account_state().entries_today == 1
+
+    position = engine.positions[0]
+    mark(engine, "BTCEUR", position.stop * 0.999)
+    engine._manage_one(position)                     # now closed
+
+    assert engine.positions == []
+    assert engine.account_state().entries_today == 1  # still counts
+
+    engine.brain._asked.clear()
+    engine._consider(make_candidate(engine, "ETHEUR"), engine.account_state())
+    assert engine.account_state().entries_today == 2
+
+
+def test_realised_aggregates_match_the_full_scan_they_replaced(engine):
+    """The SQL aggregates must agree with summing every row by hand."""
+    approve(engine)
+    for symbol in ("BTCEUR", "ETHEUR"):
+        engine.brain._asked.clear()
+        engine._consider(make_candidate(engine, symbol), engine.account_state())
+    for position in list(engine.positions):
+        mark(engine, position.symbol, position.stop * 0.999)
+        engine._manage_one(position)
+
+    by_hand = sum((row.get("realized_pnl") or 0.0) for row in engine.store.all_closed())
+    assert engine.store.total_realized() == pytest.approx(by_hand)
+    assert engine.store.realized_since(0) == pytest.approx(by_hand)
+
+
+def test_losing_streak_counts_back_from_the_most_recent_trade(engine, tmp_path):
+    from helm.models import Position, now_ms
+
+    for index, pnl in enumerate([-1.0, -1.0, 2.0, -1.0, -1.0]):
+        position = Position(
+            id=f"p{index}", symbol=f"S{index}EUR", venue="sim", qty=1.0, entry_price=100.0,
+            stop=96.0, target=112.0, initial_stop=96.0, initial_qty=1.0, risk_amount=1.5,
+            opened_at=now_ms() + index, setup="TREND_PULLBACK", score=70, conviction=60,
+        )
+        engine.store.open_position(position)
+        position.realized_pnl = pnl
+        engine.store.close_position(position, 100.0, "STOP", pnl / 1.5)
+
+    # Newest two are losses; the win before them ends the streak.
+    assert engine.account_state().consecutive_losses == 2

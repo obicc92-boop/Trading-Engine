@@ -193,8 +193,14 @@ Then, in order:
    that survives a bad month and one that doesn't.
 2. **Runner trails** on a Chandelier stop: `highest_close − 3.0×ATR`. It ratchets up, never
    down. I let winners run because the whole distribution depends on a few of them.
-3. **Regime break** → exit the runner. Two consecutive 1h closes below EMA21, or the 4h
-   regime flipping out of `TRENDING_UP`. The thesis was the trend; no trend, no thesis.
+3. **Regime break** → two consecutive 1h closes below EMA21 exits **the runner only** —
+   that is, after the scale-out. Before +1R the initial stop is the protection, and nothing
+   else gets to close the position. This distinction matters more than it looks: a pullback
+   entry buys *into* the EMA21 band, so applying this rule to a fresh position puts the
+   exit trigger millimetres from the entry and lets ordinary noise cut every trade before
+   it can work. Separately, the 4h regime flipping to `TRENDING_DOWN` exits **any**
+   position — that is rarer, decisive, and being long a confirmed higher-timeframe
+   downtrend is not something I do.
 4. **Time stop.** Under +0.5R after 24 hours → out. Capital asleep in a dead trade is
    capital that isn't available for a live one, and at €100 I have exactly three slots.
 5. **Catastrophe guard.** −8% from entry → market out immediately, whatever the stop says.

@@ -118,14 +118,28 @@ def test_highest_close_only_rises():
 
 # -- discretionary rungs -----------------------------------------------------------------
 
-def test_regime_break_exits_after_enough_closes():
-    position = make(regime_break_closes=doctrine.REGIME_BREAK_CLOSES)
+def test_regime_break_exits_the_runner_after_enough_closes():
+    position = make(regime_break_closes=doctrine.REGIME_BREAK_CLOSES,
+                    scaled_out=True, qty=0.5, target=300.0)
     assert plan(position, 101.0, analysis(), ts=HOUR).exit.kind == "REGIME_BREAK"
 
 
-def test_regime_flip_to_downtrend_exits():
-    result = plan(make(), 101.0, analysis(regime="TRENDING_DOWN"), ts=HOUR)
-    assert result.exit.kind == "REGIME_BREAK"
+def test_regime_break_does_not_cut_a_position_that_has_not_scaled_out_yet():
+    """Before +1R the initial stop is the only thing allowed to close the trade.
+
+    A pullback entry buys into the EMA21 band, so this trigger sits right on top of the
+    entry price. Applying it to a fresh position cuts every trade on noise before it has
+    any chance to work.
+    """
+    position = make(regime_break_closes=doctrine.REGIME_BREAK_CLOSES + 5)
+    assert plan(position, 101.0, analysis(), ts=HOUR).exit is None
+
+
+def test_regime_flip_to_downtrend_exits_any_position_runner_or_not():
+    """A confirmed 4h downtrend is decisive enough to override the runner-only scoping."""
+    for position in (make(), make(scaled_out=True, qty=0.5, target=300.0)):
+        result = plan(position, 101.0, analysis(regime="TRENDING_DOWN"), ts=HOUR)
+        assert result.exit.kind == "REGIME_BREAK"
 
 
 def test_time_stop_frees_a_slot_from_dead_money():
@@ -140,7 +154,8 @@ def test_time_stop_spares_a_position_that_is_working():
 
 
 def test_minimum_hold_defers_discretionary_exits():
-    position = make(regime_break_closes=doctrine.REGIME_BREAK_CLOSES)
+    position = make(regime_break_closes=doctrine.REGIME_BREAK_CLOSES,
+                    scaled_out=True, qty=0.5, target=300.0)
     assert plan(position, 101.0, analysis(), ts=60_000).exit is None
 
 
@@ -184,3 +199,62 @@ def test_a_winning_round_trip_nets_positive():
     realise(position, 0.5, 104.0, 0.02)
     realise(position, 0.5, 112.0, 0.02)
     assert position.realized_pnl > 0
+
+
+# -- regime-break counting is per bar, not per cycle --------------------------------------
+
+def _bar(open_time: float, close: float):
+    import numpy as np
+
+    from helm.models import Candles
+
+    return Candles(
+        symbol="BTCEUR", timeframe="1h",
+        open_time=np.array([open_time - 3_600_000.0, open_time]),
+        open=np.array([close, close]), high=np.array([close, close]),
+        low=np.array([close, close]), close=np.array([close, close]),
+        volume=np.array([1.0, 1.0]),
+    )
+
+
+def test_regime_break_counts_each_bar_once_however_often_it_is_checked():
+    """The management loop runs every 60s against an hourly series.
+
+    Counting per call rather than per bar reaches the two-close threshold in two minutes
+    and stops out every position almost immediately — the single most damaging bug this
+    file guards against.
+    """
+    from helm.positions import count_regime_break
+
+    position = make()
+    for _ in range(60):        # an hour of 60-second cycles, all inside one bar
+        count_regime_break(position, _bar(1_000_000.0, 90.0), 100.0)
+    assert position.regime_break_closes == 1
+
+
+def test_regime_break_advances_on_a_genuinely_new_bar():
+    from helm.positions import count_regime_break
+
+    position = make()
+    count_regime_break(position, _bar(1_000_000.0, 90.0), 100.0)
+    count_regime_break(position, _bar(4_600_000.0, 90.0), 100.0)
+    assert position.regime_break_closes == doctrine.REGIME_BREAK_CLOSES
+
+
+def test_regime_break_resets_when_price_closes_back_above():
+    from helm.positions import count_regime_break
+
+    position = make()
+    count_regime_break(position, _bar(1_000_000.0, 90.0), 100.0)
+    count_regime_break(position, _bar(4_600_000.0, 110.0), 100.0)
+    assert position.regime_break_closes == 0
+
+
+def test_a_stale_bar_never_decrements_progress():
+    """Out-of-order or repeated candle data must not un-count a real break."""
+    from helm.positions import count_regime_break
+
+    position = make()
+    count_regime_break(position, _bar(4_600_000.0, 90.0), 100.0)
+    count_regime_break(position, _bar(1_000_000.0, 110.0), 100.0)   # older bar arrives late
+    assert position.regime_break_closes == 1

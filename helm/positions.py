@@ -60,13 +60,24 @@ def update_highest_close(position: Position, candles: Candles | None, price: flo
 
 
 def count_regime_break(position: Position, candles: Candles | None, ema21: float) -> None:
-    """Count consecutive structure closes below EMA21.
+    """Count consecutive structure *closes* below EMA21.
 
-    Reset on any close back above, so it takes a genuine run of weakness rather than one
-    bad bar to trip the regime-break exit.
+    Once per bar, not once per cycle. This runs every cycle — every 60 seconds in
+    production — while the structure timeframe is hourly, so counting on each call would
+    reach "two consecutive 1h closes" in two minutes and knife every position before it
+    had a chance to work. The bar's open-time is the guard: the same bar is never counted
+    twice, however often this is called.
+
+    Resets on any close back above, so it takes a genuine run of weakness to trip the exit.
     """
     if candles is None or len(candles) < 2 or not ema21:
         return
+
+    bar_time = float(candles.open_time[-1])
+    if bar_time <= position.regime_bar_time:
+        return                                  # this bar has already been judged
+    position.regime_bar_time = bar_time
+
     if float(candles.close[-1]) < ema21:
         position.regime_break_closes += 1
     else:
@@ -146,8 +157,18 @@ def plan(position: Position, price: float, analysis: Analysis | None, ts: int | 
                        f"({doctrine.TRAIL_ATR_MULTIPLIER:.1f}x ATR below the high)",
             )
 
-    # 6. Regime break — the thesis was the trend, and the trend is gone.
-    if minimum_hold_met and position.regime_break_closes >= doctrine.REGIME_BREAK_CLOSES:
+    # 6a. Regime break on the runner — the thesis was the trend, and the trend is gone.
+    #
+    # Runners only, deliberately. A TREND_PULLBACK entry buys *into* the EMA21 band, so
+    # before the trade has proved anything this trigger sits millimetres from the entry and
+    # ordinary noise closes the position at a small loss every time. Until +1R the initial
+    # stop is the protection — that is its entire job. After the scale-out the trade is free
+    # and cutting a runner on a lost trend is the right call.
+    if (
+        position.scaled_out
+        and minimum_hold_met
+        and position.regime_break_closes >= doctrine.REGIME_BREAK_CLOSES
+    ):
         result.exit = ExitPlan(
             kind="REGIME_BREAK",
             fraction=1.0,
@@ -156,6 +177,9 @@ def plan(position: Position, price: float, analysis: Analysis | None, ts: int | 
         )
         return result
 
+    # 6b. A 4h flip into a downtrend applies to every position, runner or not. It is a far
+    # rarer and more decisive signal than a couple of hourly closes, and being long into a
+    # confirmed higher-timeframe downtrend is the one thing the doctrine refuses outright.
     if minimum_hold_met and analysis is not None and analysis.regime == "TRENDING_DOWN":
         result.exit = ExitPlan(
             kind="REGIME_BREAK",

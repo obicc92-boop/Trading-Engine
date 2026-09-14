@@ -129,6 +129,7 @@ class Engine:
                     highest_close=float(state.get("highest_close") or row["entry_price"]),
                     fees_paid=row["fees_paid"], realized_pnl=row["realized_pnl"],
                     regime_break_closes=int(state.get("regime_break_closes") or 0),
+                    regime_bar_time=float(state.get("regime_bar_time") or 0.0),
                     last_note=str(state.get("last_note") or ""),
                 )
             )
@@ -217,7 +218,10 @@ class Engine:
         self.broadcast()
         self.manage_positions()
 
-        if self._cycle % max(1, self.config.scan_every_cycles) == 1 or self._cycle == 1:
+        # Counted from the first cycle rather than by remainder-equals-one: `n % 1 == 1`
+        # is false for every integer, so the obvious form silently disables scanning
+        # altogether when someone sets the interval to 1.
+        if (self._cycle - 1) % max(1, self.config.scan_every_cycles) == 0:
             self.phase = "scanning"
             self.broadcast()
             self.hunt()
@@ -298,22 +302,19 @@ class Engine:
         if equity <= 0:
             equity = self.config.starting_equity
 
-        closed = self.store.all_closed()
         day_start = utc_day_start().timestamp() * 1000
         week_start = utc_week_start().timestamp() * 1000
 
-        realized_today = sum(
-            (row.get("realized_pnl") or 0.0) for row in closed if (row.get("closed_at") or 0) >= day_start
-        )
-        realized_week = sum(
-            (row.get("realized_pnl") or 0.0) for row in closed if (row.get("closed_at") or 0) >= week_start
-        )
-        entries_today = sum(1 for row in closed if (row.get("opened_at") or 0) >= day_start)
-        entries_today += sum(1 for p in self.positions if p.opened_at >= day_start)
+        realized_today = self.store.realized_since(day_start)
+        realized_week = self.store.realized_since(week_start)
+
+        # Counts closed *and* still-open trades opened today: the daily cap is about how
+        # many times I pulled the trigger, not how many of them happen to be finished.
+        entries_today = self.store.entries_since(day_start)
 
         streak = 0
-        for row in reversed(closed):
-            if (row.get("realized_pnl") or 0.0) < 0:
+        for result in self.store.recent_results(20):
+            if result < 0:
                 streak += 1
             else:
                 break
@@ -322,9 +323,7 @@ class Engine:
         # position's unrealised spike would let a winner that later gives back some profit
         # register as a drawdown — and a big enough round trip would trip the hard halt
         # without a single losing trade.
-        realized_equity = self.config.starting_equity + sum(
-            (row.get("realized_pnl") or 0.0) for row in closed
-        )
+        realized_equity = self.config.starting_equity + self.store.total_realized()
         peak = max(
             float(self.store.get("peak_equity", 0.0) or 0.0),
             realized_equity,

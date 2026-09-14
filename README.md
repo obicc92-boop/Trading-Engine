@@ -78,6 +78,49 @@ your credentials work, that the balance exists, that candles are flowing and tha
 decision layer responds. It never places an order. Fix everything it calls a problem before
 going near live mode.
 
+### What to look for during the dry run
+
+A dry run is only useful if you know what you are grading. After a few days, open the
+dashboard and check these, in order — the first three are about the machine, the last three
+about the strategy.
+
+**Is it healthy?**
+- The **Live** tab's narration should show a steady cycle. Long silences mean it is stuck.
+- No red "last cycle failed" banner.
+- Open positions should show a stop that moves *up* over time and never down.
+
+**Is it behaving?**
+- Entries per day never exceeds 3, open positions never exceeds 3.
+- On the **Trades** tab, no single loss should be much worse than ~1R. A −2R trade means a
+  stop did not hold and is worth investigating.
+- Holds measured in hours to days, not minutes. Minutes means something is cutting trades
+  early.
+
+**Is it any good?** This is the part that needs patience and the part the dry run mostly
+cannot answer yet.
+- Ten trades tell you almost nothing. Thirty start to mean something. The doctrine is
+  selective by design, so a few days may produce only a handful.
+- Read the **Decisions** tab, especially the refusals. The theses are the real output: if
+  the reasoning is sound but the trades lose, the edge is missing. If the reasoning is
+  sloppy, the problem is upstream of the market.
+- Expectancy in R matters more than win rate. A 40% win rate with +0.4R expectancy is a
+  good system; a 70% win rate with −0.1R expectancy is a slow bleed.
+
+If the dry week would have annoyed you, do not fund it. That is the entire point of running
+one.
+
+### Soak testing
+
+```bash
+python tools/soak.py --days 30
+```
+
+Runs the equivalent of a month of continuous operation in a couple of minutes against
+generated prices, then reports engine health and rule compliance. It exists to catch
+crashes, leaks, state loss across restarts and rail violations — **not** to say anything
+about performance. The prices are fake and its P&L is meaningless; it is a robustness test,
+not a backtest.
+
 ---
 
 ## Going live

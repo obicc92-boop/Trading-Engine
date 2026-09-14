@@ -234,6 +234,9 @@ class Position:
     entry_fee: float = 0.0
     realized_pnl: float = 0.0
     regime_break_closes: int = 0
+    # The open-time of the last structure bar counted toward a regime break. Without it the
+    # counter advances once per cycle instead of once per bar.
+    regime_bar_time: float = 0.0
     last_note: str = ""
 
     @property

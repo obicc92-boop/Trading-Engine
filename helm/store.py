@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS positions (
     state TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_positions_closed ON positions(status, closed_at DESC);
 
 CREATE TABLE IF NOT EXISTS fills (
     id TEXT PRIMARY KEY,
@@ -249,6 +250,7 @@ class Store:
                         "breakeven_set": position.breakeven_set,
                         "highest_close": position.highest_close,
                         "regime_break_closes": position.regime_break_closes,
+                        "regime_bar_time": position.regime_bar_time,
                         "last_note": position.last_note,
                     }
                 ),
@@ -286,7 +288,44 @@ class Store:
         )
 
     def all_closed(self) -> list[dict[str, Any]]:
+        """Every closed trade. For reporting only — never call this on the hot path."""
         return self._rows("SELECT * FROM positions WHERE status='CLOSED' ORDER BY closed_at")
+
+    # The engine rebuilds its account picture every cycle, several times. Doing that by
+    # loading the whole trade history worked fine on day one and gets steadily slower for
+    # the life of the account. These aggregates keep it flat instead.
+    def realized_since(self, since_ms: float) -> float:
+        row = self._row(
+            "SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM positions "
+            "WHERE status='CLOSED' AND closed_at >= ?",
+            (since_ms,),
+        )
+        return float(row["total"]) if row else 0.0
+
+    def total_realized(self) -> float:
+        row = self._row(
+            "SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM positions WHERE status='CLOSED'"
+        )
+        return float(row["total"]) if row else 0.0
+
+    def entries_since(self, since_ms: float) -> int:
+        row = self._row(
+            "SELECT COUNT(*) AS n FROM positions WHERE opened_at >= ?", (since_ms,)
+        )
+        return int(row["n"]) if row else 0
+
+    def recent_results(self, limit: int = 20) -> list[float]:
+        """The last N realised results, newest first — enough to measure a losing streak.
+
+        Bounded deliberately: a streak longer than this would have tripped a circuit
+        breaker long before, so there is nothing further back worth reading.
+        """
+        rows = self._rows(
+            "SELECT realized_pnl FROM positions WHERE status='CLOSED' "
+            "ORDER BY closed_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [float(row["realized_pnl"] or 0.0) for row in rows]
 
     # -- fills ---------------------------------------------------------------------------
     def save_fill(self, fill_id: str, position_id: str | None, fill: Any, reason: str) -> None:
