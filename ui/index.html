@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Helm</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⎈</text></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="shell">
+
+  <header class="top">
+    <div class="brand">
+      <h1>HELM</h1>
+      <span class="tag">autonomous desk</span>
+    </div>
+    <span class="pill dry" id="modePill"><i class="dot"></i><span id="modeText">connecting</span></span>
+    <span class="pill" id="venuePill" hidden></span>
+    <div class="phase" id="phase" data-phase="idle">
+      <span class="beam"></span>
+      <span id="phaseText">starting up</span>
+    </div>
+    <div class="controls">
+      <button class="ctl" id="pauseBtn">Pause</button>
+      <button class="ctl danger" id="flattenBtn">Flatten all</button>
+    </div>
+  </header>
+
+  <div id="notices"></div>
+
+  <nav class="tabs">
+    <button class="on" data-view="live">Live</button>
+    <button data-view="trades">Trades</button>
+    <button data-view="decisions">Decisions</button>
+    <button data-view="doctrine">Doctrine</button>
+  </nav>
+
+  <!-- ===================== LIVE ===================== -->
+  <section class="view on" id="view-live">
+
+    <div class="grid hero">
+      <div class="panel equity-card">
+        <div class="ring">
+          <svg viewBox="0 0 120 120">
+            <defs>
+              <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#4da3ff"/>
+                <stop offset="100%" stop-color="#25e0a0"/>
+              </linearGradient>
+            </defs>
+            <circle class="track" cx="60" cy="60" r="52"/>
+            <circle class="arc" id="ringArc" cx="60" cy="60" r="52"
+                    stroke-dasharray="326.7" stroke-dashoffset="326.7"/>
+          </svg>
+          <div class="center">
+            <span class="pct num" id="ringPct">—</span>
+            <span class="lbl">return</span>
+          </div>
+        </div>
+        <div class="equity-main">
+          <div class="value num"><span id="equity">—</span><span class="cur" id="quoteCur"></span></div>
+          <div class="sub" id="equitySub">waiting for the first cycle</div>
+          <div class="row">
+            <div><span>Today</span><b class="num" id="today">—</b></div>
+            <div><span>Free cash</span><b class="num" id="cash">—</b></div>
+            <div><span>Peak</span><b class="num" id="peak">—</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Risk right now</h2>
+        <div class="meter">
+          <div class="head"><span>Portfolio heat</span><b class="num" id="heatText">—</b></div>
+          <div class="bar"><i id="heatBar" style="width:0%"></i></div>
+        </div>
+        <div class="meter">
+          <div class="head"><span>Drawdown from peak</span><b class="num" id="ddText">—</b></div>
+          <div class="bar"><i id="ddBar" style="width:0%"></i></div>
+        </div>
+        <div class="meter">
+          <div class="head"><span>Entries used today</span><b class="num" id="entriesText">—</b></div>
+          <div class="dots" id="entryDots"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Standing orders</h2>
+        <div id="blocks"></div>
+      </div>
+    </div>
+
+    <div class="grid split" style="margin-top:14px">
+      <div class="panel">
+        <h2>What I'm doing <span class="count" id="feedCount">0</span></h2>
+        <div class="feed" id="feed">
+          <div class="empty">waiting for the engine…</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Open positions <span class="count" id="posCount">0</span></h2>
+        <div id="positions">
+          <div class="empty"><div class="big">Flat</div>No money at risk right now.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:14px">
+      <h2>Equity</h2>
+      <div class="chart-wrap">
+        <canvas id="equityChart"></canvas>
+        <div class="chart-empty" id="chartEmpty">no history yet</div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:14px">
+      <h2>Market scan <span class="count" id="scanCount">0</span></h2>
+      <div class="scan-grid" id="scan">
+        <div class="empty">first scan pending…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== TRADES ===================== -->
+  <section class="view" id="view-trades">
+    <div class="panel">
+      <h2>Performance</h2>
+      <div class="stat-grid" id="stats"></div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>Closed trades <span class="count" id="tradeCount">0</span></h2>
+      <div id="trades"><div class="empty">No closed trades yet.</div></div>
+    </div>
+  </section>
+
+  <!-- ===================== DECISIONS ===================== -->
+  <section class="view" id="view-decisions">
+    <div class="panel">
+      <h2>Decision log</h2>
+      <p class="muted" style="margin:-6px 0 16px;font-size:12.5px">
+        Every setup that reached the desk, including the ones I turned down — which is most
+        of them, and the more useful half of the record.
+      </p>
+      <div id="decisions"><div class="empty">Nothing has reached the desk yet.</div></div>
+    </div>
+  </section>
+
+  <!-- ===================== DOCTRINE ===================== -->
+  <section class="view" id="view-doctrine">
+    <div class="panel">
+      <div class="doc" id="doctrine">loading…</div>
+    </div>
+  </section>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

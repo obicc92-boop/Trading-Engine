@@ -1,232 +1,217 @@
-# Private Trading Intelligence Platform
+# Helm
 
-Private trading assistant for disciplined crypto decision support on Bybit spot markets. The platform is designed for personal use, capital protection, paper-trading rehearsal, risk-aware execution review, and performance learning.
+An autonomous trading desk for a small real-money account. It scans the market, analyses
+what it finds, decides whether anything is worth buying, sizes the position from risk rather
+than conviction, and manages the exit. It reports what it is doing in plain language while
+it does it.
 
-## Operating Principles
+Built for **€100**. That constraint drives every design decision here, and most of what a
+larger account would do is wrong at this size.
 
-- Protect capital before chasing opportunity
-- Keep risk fixed and explicit
-- Prefer high-quality signals over high signal volume
-- Treat SELL conditions in spot mode as exit or de-risk signals, not short entries
-- Keep live order placement disabled until paper-trading behavior is trusted
-
-## Current Scope
-
-- Binance public spot market data for signal candles
-- Bybit V5 spot integration for optional future live execution
-- Testnet-first operation
-- Paper trading mode with simulated fills, spot fees, slippage, and PnL tracking
-- Automatic paper entries once a setup clears the risk filters
-- Optional dual-lane execution where paper and live can run side by side from the same signal
-- Mainnet read-only posture for live balance verification before real-money rollout
-- Manual-confirmed live entries through Telegram
-- Exchange-backed live exit handling once a live position exists
-- Tiny-size rollout caps for first live trades
-- Supabase-backed signals, trades, journal entries, and performance logs
-- Telegram bot commands and alerting
-- Optional Anthropic-powered AI coach for read-only trade guidance
-- Next.js private dashboard for monitoring and review
-
-## Project Structure
-
-```text
-.
-|-- .env.example
-|-- DEPLOYMENT.md
-|-- README.md
-|-- requirements.txt
-|-- main.py
-|-- dashboard/
-|   |-- .env.example
-|   |-- app/
-|   |-- components/
-|   |-- lib/
-|   `-- package.json
-|-- engine/
-|   |-- main.py
-|   |-- models.py
-|   |-- data/
-|   |-- indicators/
-|   |-- risk/
-|   |-- services/
-|   |-- strategies/
-|   `-- utils/
-`-- supabase/
-    `-- schema.sql
+```
+scan  →  analyse  →  decide  →  size  →  execute  →  manage  →  exit
 ```
 
-## Backend Modules
+**[The Doctrine](DOCTRINE.md) is the specification.** It states the rules — the universe,
+the risk limits, the entries, the exits, the circuit breakers — in prose, and every number
+in it appears in `helm/doctrine.py` and is enforced at runtime. Read that first. This file
+only explains how to run the thing.
 
-- `engine/data/market_data.py`: fetches and normalizes Binance public OHLCV by default, with a Bybit fallback option
-- `engine/services/bybit_service.py`: Bybit V5 REST client for tickers, wallet balance, spot order placement, and order status lookup
-- `engine/indicators/technical.py`: EMA20, MA50, MA200, RSI(14), ATR, ADX, breakout levels, and volume context
-- `engine/strategies/trend_rsi.py`: higher-timeframe trend filter, breakout vs pullback entries, regime detection, and symbol-strength ranking
-- `engine/risk/manager.py`: confidence gating, volatility filtering, higher-timeframe alignment, improved stop placement, and adaptive target planning
-- `engine/services/paper_trading_service.py`: simulated entries/exits, partial profit locking, adaptive trailing, portfolio snapshotting, and journal helpers
-- `engine/services/supabase_service.py`: storage layer for signals, trades, journal entries, and performance logs
-- `engine/services/ai_coach_service.py`: Anthropic-backed, read-only coaching service for conservative trade guidance
-- `engine/services/telegram_service.py`: alerting plus `/signal`, `/live_pending`, `/live_confirm`, `/live_cancel`, `/performance`, `/status`, `/journal`, and `/coach`
-- `engine/main.py`: orchestration loop
+---
 
-## Dashboard Pages
+## Read this before you run it live
 
-- `Dashboard`: chart, active signals, portfolio metrics, and trade history
-- `Signals`: recent model output with approved and rejected setups
-- `Trade Journal`: process notes and journaling feed
-- `Performance`: equity curve and trade ledger
-- `Paper vs Live`: side-by-side comparison of grouped paper/live sibling trades
-- `Telegram Alerts`: command reference and alert policy
-- `Settings`: execution posture and safety controls
+This software places real orders with real money and **you can lose all of it**. Not as a
+disclaimer — as the actual expected range of outcomes for any trading system, this one
+included.
 
-## Supabase Tables
+What is genuinely true about it:
 
-Run [supabase/schema.sql](supabase/schema.sql) to create:
+- Risk per trade is capped at 2% of equity and enforced in three independent places.
+- Position size is derived from stop distance. Nothing can choose a size directly.
+- The decision layer can only ever make a position *smaller* or a stop *tighter*.
+- Every loss limit halts new entries automatically. A 20% drawdown halts everything.
+- Every decision, including every refusal, is recorded with its reasoning.
 
-- `signals`
-- `trades`
-- `journal_entries`
-- `performance_logs`
+What is **not** true about it:
 
-If you already ran the schema earlier, rerun it now so the `trades` table picks up the `metadata` column and the expanded live-trade status constraint.
+- It has not been backtested. There is no historical performance to show you, and the
+  synthetic market in this repo is a rendering aid, not a simulation of anything.
+- Stops are not guarantees. In a fast market a stop becomes a market order and fills where
+  it fills.
+- If the process dies or the exchange goes down, open positions are unmanaged until it
+  comes back. It reconciles against the exchange on recovery, but it cannot manage what it
+  cannot reach.
+- The setups are historically sound patterns, not predictions. Regimes change faster than
+  any rulebook adapts, and a long run of losses inside the rules is a normal outcome.
 
-## Backend Setup
+**Run it in `dry` mode for at least a week before going live.** Dry mode runs the identical
+code path against real market data with simulated fills — same sizing, same rails, same
+exits. The only substituted component is the one that moves money. If you would not have
+been happy with that week, you have learned something for free.
 
-1. Create and activate a Python 3.11+ virtual environment.
-2. Install dependencies:
+---
+
+## Running it
 
 ```bash
 pip install -r requirements.txt
-```
-
-3. Copy `.env.example` to `.env`.
-4. Fill in your Bybit, Supabase, and Telegram values.
-5. Run the SQL schema in Supabase.
-6. Start the engine:
-
-```bash
+cp .env.example .env          # then edit it
 python main.py
 ```
 
-Paper-mode note:
-- Qualified BUY setups open automatically once they pass the strategy and risk checks.
-- Paper results now include configurable spot-fee and adverse-slippage simulation so review numbers are closer to live behavior.
-- Paper trade management now supports higher-timeframe filtering, setup tagging, partial-profit lock-ins, and adaptive trailing exits.
-- The AI coach remains read-only and can be queried with `/coach` when you want extra explanation.
+The dashboard is at `http://localhost:8000`.
 
-Dual-lane note:
-- Set `PAPER_TRADING_ENABLED=true` and `LIVE_TRADING_ENABLED=true` if you want the same qualifying signal to create a paper trade and a live sibling from one engine cycle.
-- The backend links sibling trades with a shared `trade_group_id` inside `trades.metadata`.
-- The dashboard stays paper-first by default, but `/positions` and `/performance` now let you filter between the `paper` and `live` lanes, and `/compare` shows grouped paper-versus-live drift.
+With no configuration at all it starts in dry mode, pulls real Binance market data, and
+buys nothing — because with no `ANTHROPIC_API_KEY` there is no decision layer, and a
+candidate with no verdict is declined. That is the intended default: a fresh clone watches
+the market and does nothing.
 
-Live-rollout note:
-- Start with `EXECUTION_MODE=live`, `BYBIT_USE_TESTNET=false`, and `BYBIT_ALLOW_ORDER_PLACEMENT=false` for mainnet read-only validation.
-- Once read-only checks are stable, enable order placement with manual confirmation still on.
-- Live entries are clamped by `LIVE_TINY_SIZE_SCALE`, `LIVE_MAX_ORDER_NOTIONAL`, and `LIVE_MAX_DAILY_ENTRIES`.
-- Confirm real-money entries from Telegram with `/live_confirm <id>` and cancel them with `/live_cancel <id>`.
-
-## Frontend Setup
-
-1. Change into `dashboard/`.
-2. Install dependencies:
+### Check the environment before trusting it
 
 ```bash
-npm install
+python main.py doctor
 ```
 
-3. Copy `dashboard/.env.example` to `dashboard/.env.local`.
-4. Start the dashboard:
+Run this **on the machine that will actually trade**. It verifies venue reachability, that
+your credentials work, that the balance exists, that candles are flowing and that the
+decision layer responds. It never places an order. Fix everything it calls a problem before
+going near live mode.
+
+---
+
+## Going live
+
+Four things, in this order.
+
+**1. Fund the account and get keys.** On Binance, create an API key with **spot trading
+enabled and withdrawals disabled**, restricted to your server's IP. The engine has no code
+path that can withdraw, but a key that *cannot* withdraw stays safe even if the whole box
+is compromised.
+
+**2. Match the quote currency to how the account is funded.** `HELM_QUOTE=EUR` trades
+`BTCEUR` and friends. If you funded with USDT, set `HELM_QUOTE=USDT`. Getting this wrong
+means the scanner finds no tradeable pairs — `doctor` will tell you.
+
+**3. Add the decision layer.** Set `ANTHROPIC_API_KEY`. Without it nothing is ever bought.
+
+**4. Flip both switches.**
+
+```env
+HELM_MODE=live
+I_UNDERSTAND_REAL_MONEY=true
+```
+
+Both are required. `HELM_MODE=live` on its own runs dry and says so loudly at startup. Two
+switches means live trading cannot begin by accident, a stale default, or a typo.
+
+### Stopping it
+
+Three ways, in descending order of how much has to be working:
+
+- **Flatten all** in the dashboard — sells everything at market, immediately.
+- `POST /api/control/flatten` — the same thing without a browser.
+- `touch data/KILL` — the engine flattens and stops on its next cycle. No API, no UI, no
+  network. This is the one that works when nothing else does.
+
+**Pause** is different from all three: it stops new entries while continuing to manage open
+positions. That is almost always what you want, because an abandoned position is worse than
+a managed one.
+
+---
+
+## The dashboard
+
+Four tabs.
+
+**Live** — equity and return, the risk meters (portfolio heat, drawdown, entries used
+today), a running plain-language narration of what the engine is doing, open positions drawn
+to scale between their stop and target, the equity curve, and every market it scanned
+including the ones it passed over.
+
+**Trades** — closed trades only, with win rate, expectancy in R, and profit factor. Open
+positions are deliberately excluded: counting unrealised gains as performance is the most
+common way a trading record flatters itself.
+
+**Decisions** — every setup that reached the desk, taken or not, with the thesis, what would
+invalidate it, and the factor scores behind it. Most entries here are refusals. That is the
+more informative half of the record and the reason the log exists.
+
+**Doctrine** — the rulebook, rendered from `DOCTRINE.md`.
+
+Set `HELM_UI_TOKEN` before exposing any of this to the internet. The control endpoints can
+sell your positions.
+
+---
+
+## How it is put together
+
+```
+main.py                  entry point; also `python main.py doctor`
+DOCTRINE.md              the rules, in prose — the specification
+helm/
+  doctrine.py            the rules, as constants. Single source of truth.
+  config.py              operational settings from the environment
+  engine.py              the cycle: reconcile → manage → scan → decide → execute
+  risk.py                position sizing and the hard limits. Has veto power over everything.
+  positions.py           the exit ladder. Pure functions, heavily tested.
+  store.py               SQLite persistence
+  bus.py                 engine thread → browser event bridge
+  api.py                 REST + WebSocket + static UI
+  doctor.py              preflight checks
+  analysis/
+    indicators.py        EMA, RSI, ATR, ADX, Bollinger, Donchian — pure numpy
+    regime.py            4h regime classification (the veto)
+    setups.py            the three setups and their scoring
+    scanner.py           universe selection and ranking
+  brain/
+    claude.py            the decision layer; fails closed
+    prompts.py           the system prompt and the market brief
+  venues/
+    binance.py           spot crypto: market data and signed execution
+    alpaca.py            US equities, fractional
+    simulated.py         dry-run broker + synthetic market
+ui/                      dashboard: one HTML file, one CSS file, one JS file, no build step
+tests/                   97 tests
+```
+
+Two structural choices worth knowing about.
+
+**Rules are code, not configuration.** Nothing in `.env` can change a risk limit. Amending
+the doctrine means editing `helm/doctrine.py`, which means a diff and a commit. The point of
+writing rules down is that they stop being negotiable at exactly the moment they become
+inconvenient.
+
+**The exchange is the source of truth.** Every cycle reconciles open positions against the
+broker's actual balances. If they disagree, the engine is wrong and updates itself. A
+position sold by hand, a partial fill, a dust rounding — all of it gets corrected rather
+than traded against.
+
+---
+
+## Tests
 
 ```bash
-npm run dev
+python -m pytest tests/ -q
 ```
 
-## Backend Environment Example
+97 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
+exit ladder, and end-to-end trade lifecycles through the real engine against a simulated
+broker. The risk and exit tests are the ones that matter — they fail loudly if a limit is
+ever loosened.
 
-```env
-BYBIT_API_KEY=
-BYBIT_API_SECRET=
-MARKET_DATA_PROVIDER=binance
-BINANCE_BASE_URL=https://data-api.binance.vision
-BYBIT_USE_TESTNET=true
-BYBIT_BASE_URL=https://api-testnet.bybit.com
-BYBIT_ACCOUNT_TYPE=UNIFIED
-BYBIT_RECV_WINDOW=5000
-BYBIT_ALLOW_ORDER_PLACEMENT=false
-BYBIT_REQUIRE_MANUAL_CONFIRMATION=true
-LIVE_CONFIRMATION_TTL_MINUTES=15
-LIVE_TINY_SIZE_SCALE=0.10
-LIVE_MAX_ORDER_NOTIONAL=25
-LIVE_MAX_DAILY_ENTRIES=1
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your_supabase_service_key
-ANTHROPIC_API_KEY=
-ANTHROPIC_MODEL=claude-sonnet-4-20250514
-AI_COACH_ENABLED=true
-AI_COACH_MAX_TOKENS=700
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-TELEGRAM_CHAT_ID=your_telegram_chat_id
-TELEGRAM_ALLOWED_USER_ID=
-TELEGRAM_POLLING_ENABLED=true
-TRADED_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
-MARKET_INTERVALS=1m,5m,15m,1h
-HIGHER_TIMEFRAME_INTERVAL=1h
-EXECUTION_MODE=paper
-PAPER_TRADING_ENABLED=true
-LIVE_TRADING_ENABLED=false
-PAPER_STARTING_BALANCE=10000
-PAPER_FEE_RATE=0.001
-PAPER_SLIPPAGE_BPS=5
-ACCOUNT_BALANCE=10000
-RISK_PER_TRADE=0.01
-DAILY_LOSS_LIMIT=0.03
-SWING_LOOKBACK=20
-RISK_REWARD_RATIO=2.0
-BREAKOUT_LOOKBACK=20
-VOLUME_CONFIRMATION_RATIO=1.10
-SYMBOL_TOP_N=2
-SYMBOL_MIN_STRENGTH_SCORE=60
-STOP_ATR_MULTIPLIER=1.35
-TRAIL_ATR_MULTIPLIER=1.75
-PARTIAL_PROFIT_RR=1.0
-SIGNAL_CONFIDENCE_THRESHOLD=70
-MAX_VOLATILITY_PCT=0.03
-MAX_OPEN_TRADES=3
-MIN_ORDER_NOTIONAL=10
-POLL_INTERVAL_SECONDS=60
-LOG_LEVEL=INFO
-LOG_FILE_PATH=logs/trading_engine.log
-REQUEST_TIMEOUT_SECONDS=15
-MARKET_DATA_LIMIT=500
-```
+---
 
-## Dashboard Environment Example
+## Deploying
 
-```env
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_public_anon_key
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
-NEXT_PUBLIC_DEFAULT_CHART_SYMBOL=BYBIT:BTCUSDT
-```
+Any host that runs a long-lived Python process. `railway.json` and `Procfile` are included.
 
-## Safety Notes
+Two things to get right:
 
-- Spot only, no leverage, no futures in this version
-- Real orders remain disabled by default
-- The engine supports paper trading before any live rollout
-- Paper entries open automatically once the rules approve them
-- Paper metrics include configurable fee and slippage drag so small-account expectations stay more realistic
-- Higher-timeframe, setup-type, and symbol-ranking filters are intentionally selective; fewer trades is a feature, not a bug
-- Dual-lane mode lets you keep the paper ledger running while testing live fills in parallel
-- Live rollout defaults stay intentionally tiny and manually confirmed
-- The AI coach is read-only and should not be treated as permission to ignore the risk manager
-- Telegram commands can be restricted to one user with `TELEGRAM_ALLOWED_USER_ID`
-- The dashboard uses server-side Supabase access to avoid exposing sensitive write credentials client-side
+**Persistent storage.** Point `HELM_DB` at a mounted volume. The database holds open
+positions, their stops, and the reasoning behind them. Lose it and the engine rebuilds
+holdings from the exchange but loses every stop and thesis it was managing.
 
-## Operational Note
-
-As of May 8, 2026, Bybit's official V5 integration guide states that IP addresses located in the United States may be restricted and can return `403 Forbidden`. The engine uses Binance public market data by default so paper-mode signal generation does not depend on Bybit market-data access from the host. Verify legal and technical access before enabling any Bybit live execution flow.
-
-## Validation Status
-
-- Python backend compiles successfully with `python -m compileall engine main.py`
-- Frontend dependencies are installed in `dashboard/node_modules`, and `npm run build` completes successfully in this workspace
+**One instance.** Two engines on one account will fight each other — both will see the same
+balance, both will size against it, and both will manage the same positions. Never run a
+second copy against live keys.
