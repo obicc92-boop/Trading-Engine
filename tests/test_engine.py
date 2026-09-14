@@ -363,3 +363,28 @@ def test_losing_streak_counts_back_from_the_most_recent_trade(engine, tmp_path):
 
     # Newest two are losses; the win before them ends the streak.
     assert engine.account_state().consecutive_losses == 2
+
+
+def test_streak_is_stable_when_trades_close_in_the_same_millisecond(engine):
+    """All three positions can exit in one cycle, sharing a closed_at timestamp.
+
+    Without a deterministic tiebreaker SQLite may return them in any order, and the
+    consecutive-loss breaker then counts a scrambled sequence — halting trading when it
+    shouldn't, or missing a real losing streak.
+    """
+    from helm.models import Position
+
+    for index, pnl in enumerate([-1.0, -1.0, 2.0, -1.0, -1.0]):
+        position = Position(
+            id=f"tie{index}", symbol=f"T{index}EUR", venue="sim", qty=1.0, entry_price=100.0,
+            stop=96.0, target=112.0, initial_stop=96.0, initial_qty=1.0, risk_amount=1.5,
+            opened_at=1_000_000 + index, setup="TREND_PULLBACK", score=70, conviction=60,
+        )
+        engine.store.open_position(position)
+        position.realized_pnl = pnl
+        engine.store.close_position(position, 100.0, "STOP", pnl / 1.5)
+    engine.store._write("UPDATE positions SET closed_at = 5000000 WHERE id LIKE 'tie%'")
+
+    # Repeat: a non-deterministic ordering would not fail every run.
+    for _ in range(10):
+        assert engine.account_state().consecutive_losses == 2

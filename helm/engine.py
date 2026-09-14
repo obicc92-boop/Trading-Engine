@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 import traceback
+from datetime import timedelta
 
 from . import doctrine, positions as position_rules
 from .analysis import regime as regime_module, setups
@@ -26,6 +27,7 @@ from .analysis.scanner import Scanner
 from .brain.claude import Brain
 from .bus import bus
 from .models import Analysis, Candidate, Position, clean, new_id, now_ms
+from .notify.telegram import TelegramNotifier
 from .risk import AccountState, RiskEngine, utc_day_start, utc_week_start
 from .store import Store
 from .venues.base import VenueError
@@ -53,6 +55,16 @@ class Engine:
         self._scan_rows: list[dict] = []
         self._prices: dict[str, float] = {}
         self._analysis: dict[str, Analysis] = {}
+
+        self.notifier = TelegramNotifier(
+            config.telegram_token,
+            config.telegram_chat_id,
+            allowed_user_id=config.telegram_allowed_user_id,
+            commands_enabled=config.telegram_commands,
+            timeout=config.request_timeout,
+        )
+        # An armed destructive command, waiting on /confirm: (action name, expiry ms).
+        self._pending_command: tuple[str, int] | None = None
 
         self.phase = "idle"
         self.paused = bool(self.store.get("paused", False))
@@ -145,12 +157,14 @@ class Engine:
         if self._thread and self._thread.is_alive():
             return
         self._restore_positions()
+        self.notifier.start(self._telegram_handlers())
         self._stop_flag.clear()
         self._thread = threading.Thread(target=self._run, name="helm-engine", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop_flag.set()
+        self.notifier.stop()
         if self._thread:
             self._thread.join(timeout=10)
 
@@ -214,6 +228,8 @@ class Engine:
         )
         self._check_drawdown_halt(state)
 
+        self.maybe_send_digest()
+
         self.phase = "managing"
         self.broadcast()
         self.manage_positions()
@@ -246,12 +262,14 @@ class Engine:
         fill, a dust rounding — the exchange is right. Silently trading against a position
         that isn't there is how an engine loses money it never sees.
         """
-        if not self.positions:
-            return
         try:
             balances = self.broker.balances()
         except Exception as exc:
             log.warning("balance check failed: %s", exc)
+            return
+
+        self._check_orphans(balances)
+        if not self.positions:
             return
 
         instruments = self._instrument_map()
@@ -277,6 +295,56 @@ class Engine:
                 )
                 position.qty = held
                 self.store.sync_position(position)
+
+    def _check_orphans(self, balances: dict[str, float]) -> None:
+        """Flag assets sitting in the account that the engine has no plan for.
+
+        This is the symptom of losing the database — most likely a redeploy onto ephemeral
+        storage. The holdings survive on the exchange, but every stop, target and thesis
+        that was managing them is gone, and an open position with no stop is the single
+        most dangerous state this system can be in.
+
+        It deliberately warns rather than adopting. The engine cannot know what an orphan
+        was bought for, and the account may legitimately hold coins it did not buy — a
+        long-term holding in the same account must not be sold by an engine that assumed
+        every balance was its own. Whoever reads the alert decides.
+        """
+        known = {position.symbol for position in self.positions}
+        instruments = self._instrument_map()
+        if not instruments:
+            return
+
+        warned = set(self.store.get("orphans_warned", []) or [])
+        found = []
+
+        for symbol, instrument in instruments.items():
+            if symbol in known:
+                continue
+            held = balances.get(instrument.base, 0.0)
+            if held <= 0:
+                continue
+            price = self._price_of(symbol, 0.0)
+            value = held * price
+            # Ignore dust: leftover fractions below the minimum order size cannot be sold
+            # anyway, so reporting them is noise.
+            if value < max(doctrine.MIN_NOTIONAL, instrument.min_notional):
+                continue
+            found.append((symbol, held, value))
+
+        for symbol, held, value in found:
+            if symbol in warned:
+                continue
+            warned.add(symbol)
+            self.narrate(
+                f"{symbol}: the account holds {held:.8f} (~{value:.2f} {self.config.quote}) "
+                f"that I have no record of. It has NO STOP and I am not managing it. "
+                f"If the database was lost on a redeploy, put it on a persistent volume. "
+                f"Sell it by hand, or use /flatten, if it should not be there.",
+                level="error",
+            )
+
+        # Forget symbols that are no longer orphaned, so a recurrence warns again.
+        self.store.put("orphans_warned", sorted(warned & {row[0] for row in found}))
 
     def _instrument_map(self) -> dict:
         if not self.instruments:
@@ -688,6 +756,196 @@ class Engine:
         if isinstance(self.broker, SimulatedBroker):
             self.store.put("sim_balances", self.broker.snapshot())
 
+    def maybe_send_digest(self) -> None:
+        """One summary per UTC day, covering the day that just ended.
+
+        Sent even when nothing happened. A system that only speaks up when it trades is
+        indistinguishable from a system that has quietly died, and at this account size
+        most days are correctly uneventful.
+        """
+        today = utc_day_start().date().isoformat()
+        if self.store.get("last_digest_day") == today:
+            return
+        first_run = self.store.get("last_digest_day") is None
+        self.store.put("last_digest_day", today)
+        if first_run:
+            return      # nothing meaningful to summarise on the very first boot
+
+        yesterday_start = (utc_day_start() - timedelta(days=1)).timestamp() * 1000
+        today_start = utc_day_start().timestamp() * 1000
+        rows = [
+            row for row in self.store.closed_positions(100)
+            if yesterday_start <= (row.get("closed_at") or 0) < today_start
+        ]
+
+        state = self.account_state()
+        quote = self.config.quote
+        realized = sum(row.get("realized_pnl") or 0.0 for row in rows)
+        wins = sum(1 for row in rows if (row.get("realized_pnl") or 0.0) > 0)
+
+        lines = [
+            f"Daily summary — {(utc_day_start() - timedelta(days=1)).date().isoformat()}",
+            "",
+            f"Equity     {state.equity:.2f} {quote} "
+            f"({(state.equity / self.config.starting_equity - 1) * 100:+.1f}% overall)",
+            f"Yesterday  {realized:+.2f} {quote} over {len(rows)} trade(s)"
+            + (f", {wins} winner(s)" if rows else ""),
+            f"Open now   {len(self.positions)}  ·  drawdown {state.drawdown * 100:.1f}%",
+        ]
+        if rows:
+            lines.append("")
+            lines += [
+                f"  {row['symbol']} {row.get('realized_pnl') or 0:+.2f} "
+                f"({row.get('r_multiple') or 0:+.2f}R) {(row.get('exit_reason') or '').lower()}"
+                for row in rows
+            ]
+        else:
+            lines.append("")
+            lines.append("No trades. Nothing met the bar — that is the common case.")
+
+        blocks = self.risk.gate_entries(state, now_ms())
+        if blocks:
+            lines.append("")
+            lines.append(f"Currently blocked: {blocks[0]}")
+
+        # Routed straight to the notifier rather than through narrate(): the digest is a
+        # report to you, not an event in the engine's own story.
+        self.notifier.notify("\n".join(lines), "warn" if blocks else "entry")
+
+    # -- telegram ------------------------------------------------------------------------
+    def _telegram_handlers(self) -> dict:
+        """Commands the bot will answer.
+
+        Read-only queries run immediately. The two that cost money — flatten and kill —
+        arm a confirmation instead, because a fat-thumbed tap on a phone should not be able
+        to close three positions. Note what is deliberately absent: there is no command to
+        open a position or relax a limit. The bot can stop this system; it cannot aim it.
+        """
+
+        def status() -> str:
+            state = self.account_state()
+            blocks = self.risk.gate_entries(state, now_ms())
+            if self.paused:
+                blocks = ["paused by hand"] + blocks
+            quote = self.config.quote
+            lines = [
+                f"<b>{'LIVE' if self.config.live else 'DRY RUN'}</b>"
+                + ("  ⚠️ HALTED" if self.halted else ""),
+                f"Equity   {state.equity:.2f} {quote}"
+                f"  ({(state.equity / self.config.starting_equity - 1) * 100:+.1f}%)",
+                f"Today    {state.realized_today:+.2f} {quote}"
+                f"   ·  {state.entries_today}/{doctrine.MAX_ENTRIES_PER_DAY} entries",
+                f"Open     {len(self.positions)}/{doctrine.MAX_OPEN_POSITIONS}"
+                f"   ·  heat {state.open_risk:.2f} {quote}",
+                f"Drawdown {state.drawdown * 100:.1f}%",
+                f"Doing    {self.phase}  (cycle {self._cycle})",
+            ]
+            if self.synthetic:
+                lines.append("⚠️ generated prices — not a real market")
+            lines.append("")
+            lines.append("Clear to trade." if not blocks else "Not trading: " + blocks[0])
+            return "\n".join(lines)
+
+        def positions() -> str:
+            if not self.positions:
+                return "Flat — no money at risk."
+            quote = self.config.quote
+            out = []
+            for position in self.positions:
+                price = self._price_of(position.symbol, position.entry_price)
+                out.append(
+                    f"<b>{position.symbol}</b>  {position.unrealized(price):+.2f} {quote}"
+                    f"  ({position.r_multiple(price):+.2f}R)\n"
+                    f"  entry {position.entry_price:.6f}  now {price:.6f}\n"
+                    f"  stop {position.stop:.6f}  target {position.target:.6f}\n"
+                    f"  {'half banked' if position.scaled_out else 'full size'}"
+                    f"  ·  held {(now_ms() - position.opened_at) / 3_600_000:.1f}h"
+                )
+            return "\n\n".join(out)
+
+        def today() -> str:
+            day_start = utc_day_start().timestamp() * 1000
+            rows = [
+                row for row in self.store.closed_positions(50)
+                if (row.get("closed_at") or 0) >= day_start
+            ]
+            if not rows:
+                return "No trades closed today."
+            quote = self.config.quote
+            total = sum(row.get("realized_pnl") or 0.0 for row in rows)
+            lines = [
+                f"{row['symbol']}  {row.get('realized_pnl') or 0:+.2f} {quote}"
+                f"  ({row.get('r_multiple') or 0:+.2f}R)  {(row.get('exit_reason') or '').lower()}"
+                for row in rows
+            ]
+            return "\n".join(lines) + f"\n\n<b>Total {total:+.2f} {quote}</b> over {len(rows)} trades"
+
+        def pause() -> str:
+            self.pause()
+            return "Paused. Open positions stay managed; no new entries. /resume to restart."
+
+        def resume() -> str:
+            if self.halted:
+                return f"Still halted: {self.halt_reason}\nClear it from the dashboard first."
+            self.resume()
+            return "Resumed — scanning again."
+
+        def arm(action: str, prompt: str) -> str:
+            self._pending_command = (action, now_ms() + 120_000)
+            return f"{prompt}\n\nSend /confirm within 2 minutes."
+
+        def flatten() -> str:
+            if not self.positions:
+                return "Nothing to flatten — no open positions."
+            return arm(
+                "flatten",
+                f"This sells all {len(self.positions)} position(s) at market, now.",
+            )
+
+        def kill() -> str:
+            return arm(
+                "kill",
+                "This flattens everything AND stops the engine. "
+                "Restarting it needs access to the host.",
+            )
+
+        def confirm() -> str:
+            pending = self._pending_command
+            self._pending_command = None
+            if pending is None:
+                return "Nothing waiting to be confirmed."
+            action, expires = pending
+            if now_ms() > expires:
+                return "That confirmation expired. Send the command again."
+            if action == "flatten":
+                closed = self.flatten("confirmed from telegram")
+                return f"Flattened {closed} position(s)."
+            if action == "kill":
+                closed = self.flatten("kill switch from telegram")
+                self.halt("kill switch used from Telegram")
+                self._stop_flag.set()
+                return f"Flattened {closed} position(s). Engine stopped."
+            return "Unknown pending action."
+
+        def help_text() -> str:
+            return (
+                "<b>Helm</b>\n"
+                "/status — equity, risk, what I'm doing\n"
+                "/positions — open trades in detail\n"
+                "/today — trades closed today\n"
+                "/pause — stop new entries, keep managing\n"
+                "/resume — start scanning again\n"
+                "/flatten — sell everything (needs /confirm)\n"
+                "/kill — flatten and stop the engine (needs /confirm)\n"
+                "/confirm — approve the last destructive command"
+            )
+
+        return {
+            "status": status, "positions": positions, "today": today,
+            "pause": pause, "resume": resume, "flatten": flatten,
+            "kill": kill, "confirm": confirm, "help": help_text, "start": help_text,
+        }
+
     # -- output --------------------------------------------------------------------------
     def narrate(self, message: str, level: str = "info") -> None:
         """Say what is happening, in plain language.
@@ -703,6 +961,9 @@ class Engine:
         ts = now_ms()
         self.store.log_event("narrate", message, level, ts=ts)
         bus.publish("narrate", {"message": message, "level": level}, ts=ts)
+        # Queued and level-filtered inside the notifier — this call cannot block the cycle
+        # or raise, however badly Telegram is behaving.
+        self.notifier.notify(message, level)
 
     def snapshot(self) -> dict:
         state = self.account_state()

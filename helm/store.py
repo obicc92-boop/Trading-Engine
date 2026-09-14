@@ -283,13 +283,16 @@ class Store:
 
     def closed_positions(self, limit: int = 100) -> list[dict[str, Any]]:
         return self._rows(
-            "SELECT * FROM positions WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT ?",
+            "SELECT * FROM positions WHERE status='CLOSED' "
+            "ORDER BY closed_at DESC, rowid DESC LIMIT ?",
             (limit,),
         )
 
     def all_closed(self) -> list[dict[str, Any]]:
         """Every closed trade. For reporting only — never call this on the hot path."""
-        return self._rows("SELECT * FROM positions WHERE status='CLOSED' ORDER BY closed_at")
+        return self._rows(
+            "SELECT * FROM positions WHERE status='CLOSED' ORDER BY closed_at, rowid"
+        )
 
     # The engine rebuilds its account picture every cycle, several times. Doing that by
     # loading the whole trade history worked fine on day one and gets steadily slower for
@@ -320,9 +323,13 @@ class Store:
         Bounded deliberately: a streak longer than this would have tripped a circuit
         breaker long before, so there is nothing further back worth reading.
         """
+        # `rowid DESC` breaks ties on closed_at. Several positions routinely close within
+        # the same millisecond — all three can exit in one cycle — and without a stable
+        # tiebreaker SQLite is free to return them in any order, which scrambles the streak
+        # the consecutive-loss breaker is counting.
         rows = self._rows(
             "SELECT realized_pnl FROM positions WHERE status='CLOSED' "
-            "ORDER BY closed_at DESC LIMIT ?",
+            "ORDER BY closed_at DESC, rowid DESC LIMIT ?",
             (limit,),
         )
         return [float(row["realized_pnl"] or 0.0) for row in rows]

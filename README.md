@@ -245,16 +245,133 @@ ever loosened.
 
 ---
 
+## Notifications (Telegram)
+
+The dashboard is for when you are looking at it. Telegram is for when you are not — which,
+for a system that trades around the clock, is most of the time.
+
+Set two variables and it starts talking:
+
+```env
+TELEGRAM_BOT_TOKEN=...     # from @BotFather
+TELEGRAM_CHAT_ID=...       # your numeric id, from @userinfobot
+```
+
+**What it sends.** Entries, exits, halts, circuit breakers, order rejections, and one daily
+summary. It does *not* forward routine narration — the engine produces a line or two every
+cycle, and pushing those would train you to ignore the channel inside a day. Only
+entry/win/loss/warning/error levels reach your phone.
+
+The daily summary arrives even when nothing happened, and that is deliberate: at this
+account size most days are correctly uneventful, and a system that only speaks when it
+trades is indistinguishable from one that has quietly died.
+
+**What you can send back.**
+
+| Command | |
+|---|---|
+| `/status` | equity, risk, entries used, what it is doing |
+| `/positions` | open trades with entry, stop, target, R |
+| `/today` | trades closed today |
+| `/pause` · `/resume` | stop new entries, keep managing what is open |
+| `/flatten` | sell everything at market — asks for `/confirm` |
+| `/kill` | flatten and stop the engine — asks for `/confirm` |
+
+Two design choices worth stating.
+
+There is **no `/confirm_entry`**. The old build had Telegram approve each live trade; this
+one is autonomous by design, and a human gate on every entry would just be the old system
+with extra steps. The bot can stop this system — it cannot aim it.
+
+`/flatten` and `/kill` **require a second message** within two minutes. They spend real
+money, and a fat-thumbed tap on a phone should not be able to close three positions.
+
+Commands are locked to one Telegram user id. A leaked token is not great, but its worst
+case is an unwanted flatten — lost opportunity, not lost capital, since nothing in the bot
+can open a position, raise a limit, or withdraw. Set `TELEGRAM_COMMANDS=false` for alerts
+only.
+
+---
+
 ## Deploying
 
 Any host that runs a long-lived Python process. `railway.json` and `Procfile` are included.
 
-Two things to get right:
+### Railway
 
-**Persistent storage.** Point `HELM_DB` at a mounted volume. The database holds open
-positions, their stops, and the reasoning behind them. Lose it and the engine rebuilds
-holdings from the exchange but loses every stop and thesis it was managing.
+One service, `python main.py`, which runs the engine *and* serves the dashboard on `$PORT`.
 
-**One instance.** Two engines on one account will fight each other — both will see the same
-balance, both will size against it, and both will manage the same positions. Never run a
-second copy against live keys.
+**Mount a volume. This is not optional.**
+
+Create a volume in the Railway service settings, mount it at `/data`, and set:
+
+```env
+HELM_DB=/data/helm.db
+```
+
+Railway's container filesystem is wiped on every deploy. This database holds the stop,
+target and thesis for every open position — the exchange holds the coins, but nothing else
+knows what they are for. Without a volume, a redeploy while a trade is open leaves real
+money sitting on the exchange with **no stop and nothing managing it**, which is the most
+dangerous state this system has.
+
+The engine detects the aftermath and alerts loudly — on startup it compares the exchange's
+balances against its own records and reports anything it has no plan for — but detection is
+a backstop, not a fix. `python main.py doctor` warns if `HELM_DB` looks container-local.
+
+**One instance.** Two engines on one account will fight: both see the same balance, both
+size against it, both manage the same positions. Never scale this past one replica.
+
+### Migrating from the previous deployment
+
+The engine is a different program, so most of the old configuration no longer exists.
+
+**Delete all of these** — they are gone, not renamed:
+
+```
+BYBIT_*              SUPABASE_*           PAPER_*              LIVE_*
+EXECUTION_MODE       AI_COACH_*           MARKET_DATA_PROVIDER
+ACCOUNT_BALANCE      RISK_PER_TRADE       DAILY_LOSS_LIMIT     MAX_OPEN_TRADES
+RISK_REWARD_RATIO    STOP_ATR_MULTIPLIER  TRAIL_ATR_MULTIPLIER PARTIAL_PROFIT_RR
+SIGNAL_CONFIDENCE_THRESHOLD              MAX_VOLATILITY_PCT    MIN_ORDER_NOTIONAL
+SWING_LOOKBACK       BREAKOUT_LOOKBACK    VOLUME_CONFIRMATION_RATIO
+SYMBOL_TOP_N         SYMBOL_MIN_STRENGTH_SCORE                 POLL_INTERVAL_SECONDS
+```
+
+That list is the migration in miniature. Every risk and strategy parameter it contains now
+lives in `helm/doctrine.py` as a constant, unreachable from the environment. It was
+possible to widen a stop or raise the risk per trade by editing a variable in a hosting
+dashboard; now it takes a commit. A rule you can change at 2am from your phone, while
+losing, is not a rule.
+
+**Keep and rename:**
+
+| Old | New | Note |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | `TELEGRAM_BOT_TOKEN` | same bot, new commands |
+| `TELEGRAM_CHAT_ID` | `TELEGRAM_CHAT_ID` | unchanged |
+| `TELEGRAM_ALLOWED_USER_ID` | `TELEGRAM_ALLOWED_USER_ID` | now defaults to the chat id |
+| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` | unchanged |
+| `ANTHROPIC_MODEL` | `HELM_MODEL` | |
+| `TRADED_SYMBOLS` | `HELM_SYMBOLS` | optional; empty means rank by liquidity |
+| `LOG_LEVEL` | `LOG_LEVEL` | unchanged |
+
+**Add:** `HELM_MODE`, `HELM_VENUE`, `HELM_QUOTE`, `HELM_STARTING_EQUITY`, `HELM_DB`,
+`HELM_UI_TOKEN`, `BINANCE_API_KEY`, `BINANCE_API_SECRET`, and — only when you actually mean
+it — `I_UNDERSTAND_REAL_MONEY`.
+
+The old Supabase project can be deleted once you no longer want the history. Nothing reads
+it; the engine owns its own SQLite database now.
+
+### Vercel is no longer needed
+
+The old dashboard was a separate Next.js app that read from Supabase, so it had to be hosted
+somewhere. This one is three static files served by the same process that trades, reading
+state over REST and a WebSocket from memory. There is no second tier left to deploy.
+
+You *can* still put the UI on Vercel — serve `ui/` as a static site pointed at the Railway
+API — but it buys nothing and costs a cross-origin WebSocket, a CORS policy, and a second
+place for the two halves to drift out of sync. Railway already gives the service a domain.
+Set `HELM_UI_TOKEN` and use that.
+
+Delete the Vercel project when you are ready. Nothing in this repo references it.

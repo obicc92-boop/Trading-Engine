@@ -72,6 +72,13 @@ class Config:
         default_factory=lambda: os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
     )
 
+    telegram_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
+    telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", "").strip())
+    telegram_allowed_user_id: str = field(
+        default_factory=lambda: os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
+    )
+    telegram_commands: bool = field(default_factory=lambda: _bool("TELEGRAM_COMMANDS", True))
+
     anthropic_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", "").strip())
     model: str = field(default_factory=lambda: os.getenv("HELM_MODEL", "claude-opus-5").strip())
     model_effort: str = field(default_factory=lambda: os.getenv("HELM_MODEL_EFFORT", "high").strip())
@@ -108,6 +115,10 @@ class Config:
     def brain_enabled(self) -> bool:
         return bool(self.anthropic_key)
 
+    @property
+    def telegram_enabled(self) -> bool:
+        return bool(self.telegram_token and self.telegram_chat_id)
+
     def kill_file(self) -> Path:
         """A kill switch that works when everything else doesn't.
 
@@ -126,10 +137,12 @@ class Config:
             "cycle_seconds": self.cycle_seconds,
             "brain": self.brain_enabled,
             "model": self.model if self.brain_enabled else None,
+            "telegram": self.telegram_enabled,
             "keys_present": {
                 "binance": bool(self.binance_key and self.binance_secret),
                 "alpaca": bool(self.alpaca_key and self.alpaca_secret),
                 "anthropic": bool(self.anthropic_key),
+                "telegram": self.telegram_enabled,
             },
             "pinned_symbols": self.symbols,
         }

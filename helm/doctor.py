@@ -7,7 +7,13 @@ balance exist, and would an order be accepted. It never places one.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from . import doctrine
+
+class _Skip(Exception):
+    """Control flow for the synthetic venue, which has no network checks to run."""
+
 
 TICK = "  \033[32m✓\033[0m"
 CROSS = "  \033[31m✗\033[0m"
@@ -27,15 +33,18 @@ def run(config) -> int:
 
     # -- venue ---------------------------------------------------------------------------
     market = None
-    if config.venue == "synthetic":
+    synthetic = config.venue == "synthetic"
+    if synthetic:
         # An explicit request for generated prices. Say so bluntly — it is a demo posture,
         # not a degraded one, and it must never be mistaken for a live configuration.
+        # Storage and notification checks still run below: they matter either way.
         print(f"{WARN} venue is 'synthetic' — prices are generated, nothing here is a real market")
         print("      set HELM_VENUE=binance (or alpaca) to trade an actual venue")
         warnings += 1
-        return _finish(problems, warnings)
 
     try:
+        if synthetic:
+            raise _Skip()
         if config.venue == "alpaca":
             from .venues.alpaca import AlpacaVenue
 
@@ -50,6 +59,8 @@ def run(config) -> int:
         if not instruments:
             print(f"{CROSS} no {config.quote} pairs found — is HELM_QUOTE right for this venue?")
             problems += 1
+    except _Skip:
+        pass
     except Exception as exc:
         print(f"{CROSS} {config.venue} unreachable: {exc}")
         print("      the engine will fall back to generated prices and trade nothing real")
@@ -79,7 +90,9 @@ def run(config) -> int:
                 break
 
     # -- credentials ---------------------------------------------------------------------
-    if config.live:
+    if synthetic:
+        pass
+    elif config.live:
         try:
             balances = market.balances()
             cash = balances.get(config.quote, 0.0)
@@ -121,10 +134,45 @@ def run(config) -> int:
 
         store = Store(config.db_path)
         store.put("doctor", "ok")
-        print(f"{TICK} storage writable at {config.db_path}")
+        open_count = len(store.load_open_positions())
+        print(f"{TICK} storage writable at {config.db_path} ({open_count} open position(s) on record)")
+
+        # The database carries the stop and thesis for every open position. On a platform
+        # with an ephemeral filesystem, a redeploy silently drops all of it and leaves the
+        # coins on the exchange with nothing managing them.
+        resolved = Path(config.db_path).resolve()
+        ephemeral_roots = ("/app", "/tmp", "/workspace", "/usr/src")
+        if any(str(resolved).startswith(root) for root in ephemeral_roots):
+            print(f"{WARN} {resolved} looks like container-local storage")
+            print("      mount a volume and point HELM_DB at it, or a redeploy loses every")
+            print("      open position's stop while the coins stay on the exchange")
+            warnings += 1
     except Exception as exc:
         print(f"{CROSS} storage failed: {exc}")
         problems += 1
+
+    # -- notifications ---------------------------------------------------------------------
+    if config.telegram_enabled:
+        try:
+            import httpx
+
+            response = httpx.post(
+                f"https://api.telegram.org/bot{config.telegram_token}/sendMessage",
+                json={"chat_id": config.telegram_chat_id,
+                      "text": "Helm preflight: notifications are working."},
+                timeout=15.0,
+            )
+            if response.status_code < 400:
+                print(f"{TICK} telegram reachable — a test message was sent")
+            else:
+                print(f"{CROSS} telegram rejected the message: {response.text[:160]}")
+                problems += 1
+        except Exception as exc:
+            print(f"{CROSS} telegram unreachable: {exc}")
+            problems += 1
+    else:
+        print(f"{WARN} telegram not configured — the engine will trade silently")
+        warnings += 1
 
     if config.kill_file().exists():
         print(f"{WARN} kill file present at {config.kill_file()} — the engine will stop immediately")
