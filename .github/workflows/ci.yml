@@ -1,0 +1,113 @@
+# Helm CI.
+#
+# This repository places real orders. These checks are the last automated thing standing
+# between a bad edit and money, so they run on every push and every pull request, and a
+# red run means do not merge.
+#
+# Two required jobs. `tests` proves the arithmetic and the rails are correct; `soak` proves
+# the engine survives a month of continuous operation without violating them. A change can
+# pass one and fail the other, so they report separately.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly, for the fuzz job below.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# CI reads code and runs simulations against generated prices. It never needs write access,
+# and no job here is given a secret — there is nothing for a compromised dependency to take.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tracks .python-version, so CI cannot drift from the version the engine is pinned to
+      # in deployment.
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # pytest is deliberately not in requirements.txt — nothing in the order path should
+      # ship a test runner.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      # tests/conftest.py forces HELM_VENUE=synthetic and HELM_MODE=dry and strips every API
+      # key, so this cannot reach a real venue whatever the runner happens to have set.
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  soak:
+    name: soak
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 30 simulated days including restarts mid-trade. Exits non-zero on any engine error
+      # or rail violation, so this fails if a limit is ever quietly loosened.
+      #
+      # --start-at is pinned because synthetic prices are a pure function of time: without
+      # it every run walks a different price path, and a required check that fails
+      # unreproducibly is one you learn to ignore. The nightly job below walks fresh paths
+      # instead, where a failure can be investigated without blocking a merge.
+      - name: Soak the engine
+        run: python tools/soak.py --days 30 --start-at 1757000000000
+
+  fuzz:
+    name: nightly fuzz soak
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Unpinned: a different price path every night, which is the point — it explores
+      # market shapes the pinned run never sees. A failure here prints the exact
+      # --start-at needed to replay it.
+      - name: Soak an unseen price path
+        run: python tools/soak.py --days 60

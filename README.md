@@ -1,5 +1,7 @@
 # Helm
 
+[![CI](https://github.com/obicc92-boop/Trading-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/obicc92-boop/Trading-Engine/actions/workflows/ci.yml)
+
 An autonomous trading desk for a small real-money account. It scans the market, analyses
 what it finds, decides whether anything is worth buying, sizes the position from risk rather
 than conviction, and manages the exit. It reports what it is doing in plain language while
@@ -121,6 +123,18 @@ crashes, leaks, state loss across restarts and rail violations — **not** to sa
 about performance. The prices are fake and its P&L is meaningless; it is a robustness test,
 not a backtest.
 
+Synthetic prices are a pure function of time, so an unpinned run walks a different price
+path every time. That is useful — each run explores a market shape the last one did not —
+but it means a failure has to be replayable. Every run prints its `--start-at`, and a
+failing one prints the full command to reproduce it:
+
+```bash
+python tools/soak.py --days 30 --start-at 1757000000000
+```
+
+CI pins that value so a red build always means a real regression rather than an unlucky
+path; a nightly job runs unpinned to keep exploring new ones.
+
 ---
 
 ## Going live
@@ -238,10 +252,13 @@ than traded against.
 python -m pytest tests/ -q
 ```
 
-97 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
+138 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
 exit ladder, and end-to-end trade lifecycles through the real engine against a simulated
 broker. The risk and exit tests are the ones that matter — they fail loudly if a limit is
 ever loosened.
+
+These run in CI on every push and pull request, alongside a 30-day soak. Both must be green
+before anything merges — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ---
 

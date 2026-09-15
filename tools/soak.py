@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import gc
 import resource
-import shutil
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -104,6 +103,19 @@ def rss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
+def clear_database(path: Path) -> None:
+    """Remove this database and its sqlite sidecars — and nothing else.
+
+    Deliberately never removes the containing directory. `--db data/helm.db` is the obvious
+    thing to type, and that is the live deployment's own database: taking its parent would
+    delete every open position's stop and target, along with the KILL file, while the coins
+    stayed on the exchange with nothing managing them.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for stale in (path, *(path.with_name(path.name + suffix) for suffix in ("-wal", "-shm"))):
+        stale.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=float, default=7.0)
@@ -113,13 +125,21 @@ def main() -> int:
     parser.add_argument("--restart-every", type=int, default=200,
                         help="rebuild the Engine from disk every N cycles, to prove that "
                              "state survives a redeploy")
+    parser.add_argument("--start-at", type=int, default=None,
+                        help="epoch ms to start the simulated clock at. Synthetic prices are a "
+                             "pure function of time, so pinning this pins the whole price path "
+                             "and makes a run exactly reproducible. Defaults to now, which walks "
+                             "a fresh path every time")
     args = parser.parse_args()
 
-    shutil.rmtree(Path(args.db).parent, ignore_errors=True)
+    clear_database(Path(args.db))
 
     import helm.engine as engine_module
 
-    CLOCK[0] = int(datetime.now(timezone.utc).timestamp() * 1000)
+    started_at = args.start_at if args.start_at is not None else int(
+        datetime.now(timezone.utc).timestamp() * 1000
+    )
+    CLOCK[0] = started_at
     install_clock()
 
     config = Config()
@@ -140,7 +160,8 @@ def main() -> int:
     rss_samples: list[float] = []
 
     print(f"soaking {args.days:g} simulated days — {cycles} cycles at "
-          f"{args.step_minutes}m intervals\n")
+          f"{args.step_minutes}m intervals\n"
+          f"price path: --start-at {started_at}\n")
 
     for i in range(1, cycles + 1):
         CLOCK[0] += step_ms
@@ -238,6 +259,12 @@ def main() -> int:
         print("\nERRORS")
         for error in errors[:10]:
             print(f"  {error}")
+
+    if errors or violations:
+        # An unreproducible failure is a failure you will eventually learn to ignore.
+        print("\nreplay this exact run with:")
+        print(f"  python tools/soak.py --days {args.days:g} --step-minutes {args.step_minutes} "
+              f"--restart-every {args.restart_every} --start-at {started_at}")
 
     print()
     gc.collect()
