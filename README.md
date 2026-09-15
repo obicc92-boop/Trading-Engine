@@ -139,7 +139,7 @@ path; a nightly job runs unpinned to keep exploring new ones.
 
 ## Going live
 
-Four things, in this order.
+Five things, in this order.
 
 **1. Fund the account and get keys.** On Binance, create an API key with **spot trading
 enabled and withdrawals disabled**, restricted to your server's IP. The engine has no code
@@ -152,15 +152,27 @@ means the scanner finds no tradeable pairs — `doctor` will tell you.
 
 **3. Add the decision layer.** Set `ANTHROPIC_API_KEY`. Without it nothing is ever bought.
 
-**4. Flip both switches.**
+**4. Guard the control API.** Set `HELM_UI_TOKEN` to a long random string:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+The guard fails open. With no token set, `POST /api/control/flatten` sells everything and
+`/api/control/pause` stops the engine, for anyone who can reach the port — no credential
+required. That is a deliberate convenience when it is bound to a laptop, and an open
+liquidate button the moment the service has a domain, which on Railway it does by default.
+
+**5. Flip both switches.**
 
 ```env
 HELM_MODE=live
 I_UNDERSTAND_REAL_MONEY=true
 ```
 
-Both are required. `HELM_MODE=live` on its own runs dry and says so loudly at startup. Two
-switches means live trading cannot begin by accident, a stale default, or a typo.
+All three of these are required for live trading — the two switches and the token. Any one
+missing and the engine runs dry and says at startup exactly which. Live trading cannot begin
+by accident, a stale default, or a typo, and it cannot begin with the controls wide open.
 
 ### Stopping it
 
@@ -338,6 +350,13 @@ a backstop, not a fix. `python main.py doctor` warns if `HELM_DB` looks containe
 
 **One instance.** Two engines on one account will fight: both see the same balance, both
 size against it, both manage the same positions. Never scale this past one replica.
+
+**Set `HELM_UI_TOKEN`.** Railway gives the service a public `*.up.railway.app` domain, and
+the control API fails open: with no token, anyone who has the URL can `POST
+/api/control/flatten` and sell the account. Live mode refuses to start without one, but set
+it for the dry run too — the dry run is what you will leave running and forget about.
+
+`/health` stays unauthenticated on purpose, so Railway's healthcheck keeps working.
 
 ### Migrating from the previous deployment
 

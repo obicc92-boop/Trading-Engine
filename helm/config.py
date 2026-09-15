@@ -104,12 +104,23 @@ class Config:
 
     @property
     def live(self) -> bool:
-        """Live only when both switches agree.
+        """Live only when every switch agrees.
 
-        `mode=live` without the acknowledgement runs dry and says so loudly at boot —
-        failing closed is the only acceptable default when the failure mode is money.
+        `mode=live` without the acknowledgement, or without a UI token, runs dry and says so
+        loudly at boot — failing closed is the only acceptable default when the failure mode
+        is money.
+
+        The token belongs in that list because the control API fails open: the guard in
+        `api.py` waves everything through when `HELM_UI_TOKEN` is unset, which is fine on a
+        laptop and not fine anywhere with a domain. Railway gives every service one, and
+        `POST /api/control/flatten` sells the account. Real money therefore requires a token.
         """
-        return self.mode == "live" and self.live_ack
+        return self.mode == "live" and self.live_ack and bool(self.ui_token)
+
+    @property
+    def control_api_is_open(self) -> bool:
+        """True when anyone who can reach the port can pause, flatten or close positions."""
+        return not self.ui_token
 
     @property
     def brain_enabled(self) -> bool:

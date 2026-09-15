@@ -58,9 +58,17 @@ def banner(config, engine) -> None:
     print(f"  Quote       {config.quote}")
     print(f"  Decisions   {config.model if config.brain_enabled else 'DISABLED — no API key, nothing will be bought'}")
     print(f"  Dashboard   http://{config.host}:{config.port}")
-    if config.mode == "live" and not config.live_ack:
-        print("\n  !! HELM_MODE=live but I_UNDERSTAND_REAL_MONEY is not set.")
-        print("     Running dry. Both are required before real orders are sent.")
+    if config.mode == "live" and not config.live:
+        print("\n  !! HELM_MODE=live but this is running DRY, because:")
+        if not config.live_ack:
+            print("     - I_UNDERSTAND_REAL_MONEY is not set.")
+        if not config.ui_token:
+            print("     - HELM_UI_TOKEN is not set, so the control API is unguarded.")
+            print("       Anyone who reaches this port could flatten the account.")
+        print("     Fix the above before real orders are sent.")
+    elif config.control_api_is_open:
+        print("\n  !  HELM_UI_TOKEN is not set — pause/flatten/close are unauthenticated.")
+        print("     Fine on a laptop. Set one before exposing this to a network.")
     print("=" * 62 + "\n")
 
 

@@ -31,6 +31,19 @@ def run(config) -> int:
         print(f"{WARN} HELM_MODE=live but I_UNDERSTAND_REAL_MONEY is unset — running dry")
         warnings += 1
 
+    # The control API waves everything through when no token is set. Harmless bound to a
+    # laptop, and an open liquidate button on anything with a domain.
+    if config.control_api_is_open:
+        if config.mode == "live":
+            print(f"{CROSS} HELM_UI_TOKEN is unset — the control API is unauthenticated")
+            print("      live mode refuses to start without it: anyone who reached the port")
+            print("      could POST /api/control/flatten and sell the account")
+            problems += 1
+        else:
+            print(f"{WARN} HELM_UI_TOKEN is unset — pause/flatten/close are unauthenticated")
+            print("      set one before this is reachable from anywhere but localhost")
+            warnings += 1
+
     # -- venue ---------------------------------------------------------------------------
     market = None
     synthetic = config.venue == "synthetic"
