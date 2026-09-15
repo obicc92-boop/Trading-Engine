@@ -4,7 +4,10 @@
 venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 logs/
-dashboard/node_modules/
-dashboard/.next/
-dashboard/.env.local
+data/
+*.db
+*.db-wal
+*.db-shm
+KILL
