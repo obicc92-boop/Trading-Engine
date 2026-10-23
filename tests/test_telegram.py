@@ -158,6 +158,30 @@ def test_unknown_command_lists_what_exists(notifier):
     assert "/status" in notifier.posted[0] and "/today" in notifier.posted[0]
 
 
+def test_a_refused_poll_backs_off_and_says_why(notifier, caplog):
+    """A 409 means another process holds the same token. Telegram answers it instantly, so
+    retrying without a pause would hammer the API for as long as that process runs."""
+    class Refused:
+        def json(self):
+            return {"ok": False, "error_code": 409,
+                    "description": "Conflict: terminated by other getUpdates request"}
+
+    polls, waits = [], []
+
+    def refused(*args, **kwargs):
+        polls.append(1)
+        if len(polls) > 3:                   # a loop with no back-off would never stop
+            notifier._stop.set()
+        return Refused()
+
+    notifier._client.get = refused
+    notifier._stop.wait = lambda seconds: waits.append(seconds) or notifier._stop.set()
+    with caplog.at_level("WARNING", logger="helm.telegram"):
+        notifier._poll()
+    assert waits == [10.0]
+    assert "Conflict" in caplog.text
+
+
 # -- the command surface is deliberately narrow ------------------------------------------
 
 def test_no_command_can_open_a_position_or_loosen_a_limit(engine):
