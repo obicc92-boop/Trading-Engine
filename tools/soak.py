@@ -100,7 +100,9 @@ class StubDesk:
 
 
 def rss_mb() -> float:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    # ru_maxrss is kilobytes on Linux but bytes on macOS, which otherwise reads 50MB as 50GB.
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
 
 
 def clear_database(path: Path) -> None:

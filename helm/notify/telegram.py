@@ -63,6 +63,7 @@ class TelegramNotifier:
         self._sender: threading.Thread | None = None
         self._poller: threading.Thread | None = None
         self._offset = 0
+        self._poll_refused = False
         self._handlers: dict[str, Callable[[], str]] = {}
         self._client = httpx.Client(timeout=timeout)
         self.sent = 0
@@ -199,6 +200,18 @@ class TelegramNotifier:
                 # must not spin hot if Telegram is down for hours.
                 self._stop.wait(10.0)
                 continue
+
+            if not data.get("ok", False):
+                # Usually a 409: another process is polling with the same token, and every
+                # command it reads first never reaches this engine. Telegram answers that
+                # instantly, so without the pause this loop spins hot for as long as the other
+                # process runs. Warn once per streak rather than once per refusal.
+                if not self._poll_refused:
+                    log.warning("telegram refused the command poll: %s", data.get("description", ""))
+                self._poll_refused = True
+                self._stop.wait(10.0)
+                continue
+            self._poll_refused = False
 
             for update in data.get("result", []):
                 self._offset = max(self._offset, int(update["update_id"]) + 1)
