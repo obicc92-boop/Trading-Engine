@@ -265,7 +265,7 @@ helm/
     alpaca.py            US equities, fractional
     simulated.py         dry-run broker + synthetic market
 ui/                      dashboard: one HTML file, one CSS file, one JS file, no build step
-tests/                   164 tests
+tests/                   167 tests
 ```
 
 Two structural choices worth knowing about.
@@ -288,7 +288,7 @@ than traded against.
 python -m pytest tests/ -q
 ```
 
-164 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
+167 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
 exit ladder, and end-to-end trade lifecycles through the real engine against a simulated
 broker. The risk and exit tests are the ones that matter — they fail loudly if a limit is
 ever loosened.
