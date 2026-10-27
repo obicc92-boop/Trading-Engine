@@ -298,6 +298,20 @@ def main() -> int:
     closed = engine.store.all_closed()
     state = engine.account_state()
 
+    # Coins left in the account that no open position accounts for: the slivers exits
+    # cannot sell. Equity leaves them out, so they are shown on their own — a few cents is
+    # normal, and anything more means exits are leaving money behind again.
+    balances = engine.broker.balances()
+    in_positions: dict[str, float] = {}
+    for position in engine.positions:
+        base = engine._base_of(position.symbol)
+        in_positions[base] = in_positions.get(base, 0.0) + position.qty
+    dust = sum(
+        (balances.get(engine._base_of(symbol), 0.0) - in_positions.get(engine._base_of(symbol), 0.0))
+        * engine._price_of(symbol)
+        for symbol in symbols
+    )
+
     holds = {}
     for symbol, frames in series.items():
         minutes = frames["1m"]
@@ -316,6 +330,7 @@ def main() -> int:
     print(f"\n  starting equity    {args.equity:8.2f} {args.quote}")
     print(f"  ending equity      {state.equity:8.2f} {args.quote}   "
           f"({(state.equity / args.equity - 1) * 100:+.1f}%)")
+    print(f"  left as dust       {dust:8.2f} {args.quote}   (unsellable slivers, outside equity)")
     print(f"  max drawdown       {max_dd * 100:7.1f}%")
     print(f"  hard halt          {'never' if not halted_at else _date(halted_at[0]) + ' — ' + halted_at[1]}")
     print(f"  buy and hold       " + "   ".join(f"{s[:-len(args.quote)]} {v:+.0f}%" for s, v in holds.items())

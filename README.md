@@ -37,10 +37,11 @@ What is genuinely true about it:
 
 What is **not** true about it:
 
-- It has no record of making money. The first backtest of the rules alone — no decision
-  layer — lost 17.8% over six months of 2026 while simply holding the same four coins made
-  11%, and it hit the 20% hard halt in August. See [Backtesting](#backtesting). The
-  synthetic market in this repo is a rendering aid, not a simulation of anything.
+- It has no record of making money. A backtest of the rules alone — no decision layer —
+  over April to October 2026 on BTC, ETH, SOL and XRP lost 10.2% while simply holding the
+  same four coins made 11%. Before fees its 140 trades came out about even (−€0.53); the
+  €9.63 paid in fees is nearly all of the loss. See [Backtesting](#backtesting).
+  The synthetic market in this repo is a rendering aid, not a simulation of anything.
 - Stops are not guarantees. In a fast market a stop becomes a market order and fills where
   it fills.
 - If the process dies or the exchange goes down, open positions are unmanaged until it
@@ -264,7 +265,7 @@ helm/
     alpaca.py            US equities, fractional
     simulated.py         dry-run broker + synthetic market
 ui/                      dashboard: one HTML file, one CSS file, one JS file, no build step
-tests/                   151 tests
+tests/                   164 tests
 ```
 
 Two structural choices worth knowing about.
@@ -287,7 +288,7 @@ than traded against.
 python -m pytest tests/ -q
 ```
 
-151 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
+164 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
 exit ladder, and end-to-end trade lifecycles through the real engine against a simulated
 broker. The risk and exit tests are the ones that matter — they fail loudly if a limit is
 ever loosened.
