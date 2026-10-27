@@ -24,6 +24,9 @@ log = logging.getLogger("helm.binance")
 # venue with different names doesn't silently get the wrong timeframe.
 INTERVALS = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "5m": "5m", "1m": "1m"}
 
+# Spot taker fee when it is paid in BNB (0.10% less the 25% BNB discount).
+BNB_TAKER_FEE = 0.00075
+
 
 class BinanceVenue:
     name = "binance"
@@ -241,15 +244,31 @@ class BinanceVenue:
         fills = data.get("fills") or []
         qty = float(data.get("executedQty", 0) or 0)
         quote_qty = float(data.get("cummulativeQuoteQty", 0) or 0)
-        fee = 0.0
-        for leg in fills:
-            # Fees paid in the base asset (no BNB balance) reduce the quantity we own.
-            if leg.get("commissionAsset") == symbol.replace(self.quote_asset, ""):
-                continue
-            fee += float(leg.get("commission", 0) or 0)
         price = (quote_qty / qty) if qty > 0 else 0.0
         if price <= 0 and fills:
             price = float(fills[0].get("price", 0) or 0)
+
+        # Every fee is recorded in the quote currency, whatever it was paid in.
+        base = symbol[: -len(self.quote_asset)] if symbol.endswith(self.quote_asset) else symbol
+        fee = 0.0
+        for leg in fills:
+            commission = float(leg.get("commission", 0) or 0)
+            asset = leg.get("commissionAsset")
+            leg_price = float(leg.get("price", 0) or 0) or price
+            if asset == self.quote_asset:
+                fee += commission
+            elif asset == base:
+                # With no BNB to pay in, a buy's fee comes out of the coins received. We own
+                # that much less than executedQty, and recording the gross amount would make
+                # every final exit ask for coins the account does not have — an order the
+                # exchange rejects whole, which means a stop that never fires.
+                if side == "BUY":
+                    qty -= commission
+                fee += commission * leg_price
+            elif commission:
+                # Paid in a third asset, usually BNB, whose price is not to hand. Charge the
+                # BNB-discounted taker rate on the leg rather than count BNB units as cash.
+                fee += float(leg.get("qty", 0) or 0) * leg_price * BNB_TAKER_FEE
         return Fill(
             order_id=str(data.get("orderId", "")),
             symbol=symbol,
