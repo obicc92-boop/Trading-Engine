@@ -26,7 +26,7 @@ from .analysis import regime as regime_module, setups
 from .analysis.scanner import Scanner
 from .brain.claude import Brain
 from .bus import bus
-from .models import Analysis, Candidate, Position, clean, new_id, now_ms
+from .models import Analysis, Candidate, Fill, Position, clean, new_id, now_ms
 from .notify.telegram import TelegramNotifier
 from .risk import AccountState, RiskEngine, utc_day_start, utc_week_start
 from .store import Store
@@ -272,11 +272,8 @@ class Engine:
         if not self.positions:
             return
 
-        instruments = self._instrument_map()
         for position in list(self.positions):
-            instrument = instruments.get(position.symbol)
-            base = instrument.base if instrument else position.symbol.replace(self.config.quote, "")
-            held = balances.get(base, 0.0)
+            held = balances.get(self._base_of(position.symbol), 0.0)
             if held >= position.qty * 0.98:
                 continue
             if held <= position.qty * 0.02:
@@ -327,7 +324,7 @@ class Engine:
             value = held * price
             # Ignore dust: leftover fractions below the minimum order size cannot be sold
             # anyway, so reporting them is noise.
-            if value < max(doctrine.MIN_NOTIONAL, instrument.min_notional):
+            if value < self._dust_floor(symbol):
                 continue
             found.append((symbol, held, value))
 
@@ -353,6 +350,15 @@ class Engine:
             except Exception as exc:
                 log.warning("instrument load failed: %s", exc)
         return self.instruments
+
+    def _base_of(self, symbol: str) -> str:
+        instrument = self._instrument_map().get(symbol)
+        return instrument.base if instrument else symbol.replace(self.config.quote, "")
+
+    def _dust_floor(self, symbol: str) -> float:
+        """The value below which a holding is dust: too small to sell as an order of its own."""
+        instrument = self._instrument_map().get(symbol)
+        return max(doctrine.MIN_NOTIONAL, instrument.min_notional if instrument else 0.0)
 
     # -- account -------------------------------------------------------------------------
     def account_state(self) -> AccountState:
@@ -485,23 +491,58 @@ class Engine:
 
         self._execute_exit(position, result.exit, price)
 
-    def _execute_exit(self, position: Position, exit_plan, price: float) -> None:
-        qty = position.qty * exit_plan.fraction
+    def _sell_out(self, position: Position, fraction: float) -> tuple[Fill, float, bool]:
+        """Sell `fraction` of a position and book it. Returns (fill, net, books closed).
+
+        A final exit does two more things. It also sells any dust earlier trades left in
+        the same coin — only an amount too small to sell on its own, so a holding the engine
+        did not buy is never touched. And it writes off whatever still cannot be sold, so
+        the booked result matches the cash. A remainder too big to be dust is a short fill,
+        not a sliver: the position stays open and the next cycle sells the rest.
+        """
+        final = fraction >= 1.0
+        qty = position.qty * fraction
+        price = self._price_of(position.symbol, position.entry_price)
+        if final:
+            try:
+                held = self.broker.balances().get(self._base_of(position.symbol), 0.0)
+            except Exception as exc:
+                log.warning("balance check before exit failed: %s", exc)
+                held = position.qty
+            extra = held - position.qty
+            if 0 < extra * price < self._dust_floor(position.symbol):
+                qty += extra
+            if held > 0:
+                # Never ask for more than the account holds: the exchange rejects the whole
+                # order, and a rejected exit is a stop that never fires.
+                qty = min(qty, held)
         instrument = self._instrument_map().get(position.symbol)
         if instrument is not None:
             qty = instrument.round_qty(qty) or qty
         if qty <= 0:
-            return
+            raise VenueError(f"{position.symbol}: nothing to sell")
 
+        fill = self.broker.sell(position.symbol, qty)
+        own = min(fill.qty, position.qty)
+        own_fee = fill.fee * (own / fill.qty) if fill.qty > 0 else fill.fee
+        net = position_rules.realise(position, own, fill.price, own_fee)
+        if fill.qty > own:
+            net += position_rules.book_swept(position, fill.qty - own, fill.price, fill.fee - own_fee)
+
+        if not final or position.qty * price >= self._dust_floor(position.symbol):
+            return fill, net, False
+        net += position_rules.write_off(position)
+        return fill, net, True
+
+    def _execute_exit(self, position: Position, exit_plan, price: float) -> None:
         self.phase = "executing"
         self.broadcast()
         try:
-            fill = self.broker.sell(position.symbol, qty)
+            fill, net, closed = self._sell_out(position, exit_plan.fraction)
         except VenueError as exc:
             self.narrate(f"Exit order for {position.symbol} was rejected: {exc}", level="error")
             return
 
-        net = position_rules.realise(position, fill.qty, fill.price, fill.fee)
         self.store.save_fill(new_id("fill"), position.id, fill, exit_plan.kind)
 
         if exit_plan.kind == "SCALE_OUT":
@@ -513,6 +554,16 @@ class Engine:
                 level="win" if net > 0 else "info",
             )
             bus.publish("position_update", position.to_dict(price))
+            return
+
+        if not closed:
+            position.last_note = f"{exit_plan.reason} Filled short; selling the rest next cycle."
+            self.store.sync_position(position)
+            self.narrate(
+                f"{position.symbol}: exit filled short — {position.qty:.8f} still held. "
+                f"Selling the rest next cycle.",
+                level="warn",
+            )
             return
 
         self._finalise(position, fill.price, exit_plan.kind, reason_text=exit_plan.reason, net=net)
@@ -724,9 +775,11 @@ class Engine:
         closed = 0
         for position in list(self.positions):
             try:
-                fill = self.broker.sell(position.symbol, position.qty)
-                net = position_rules.realise(position, fill.qty, fill.price, fill.fee)
+                fill, net, done = self._sell_out(position, 1.0)
                 self.store.save_fill(new_id("fill"), position.id, fill, "FLATTEN")
+                if not done:
+                    self.store.sync_position(position)
+                    raise VenueError(f"filled short, {position.qty:.8f} still held")
                 self._finalise(position, fill.price, "FLATTENED", reason_text=f"flattened ({reason}).", net=net)
             except Exception as exc:
                 log.error("flatten failed for %s: %s", position.symbol, exc)
@@ -742,12 +795,15 @@ class Engine:
             if position.id != position_id:
                 continue
             try:
-                fill = self.broker.sell(position.symbol, position.qty)
+                fill, net, closed = self._sell_out(position, 1.0)
             except Exception as exc:
                 self.narrate(f"Could not close {position.symbol}: {exc}", level="error")
                 return False
-            net = position_rules.realise(position, fill.qty, fill.price, fill.fee)
             self.store.save_fill(new_id("fill"), position.id, fill, "MANUAL")
+            if not closed:
+                self.store.sync_position(position)
+                self.narrate(f"{position.symbol} filled short — {position.qty:.8f} still held.", level="error")
+                return False
             self._finalise(position, fill.price, "MANUAL", reason_text="closed by hand.", net=net)
             return True
         return False

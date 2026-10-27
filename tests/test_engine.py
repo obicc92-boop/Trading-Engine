@@ -282,6 +282,120 @@ def test_equity_reflects_realised_results(engine):
     assert engine.account_state().equity > start
 
 
+# -- lot steps and dust ------------------------------------------------------------------
+#
+# The synthetic market has no lot step, so it can never leave dust. These tests give it
+# Binance's BTCEUR step (0.00001 BTC) so every exit floors the way a real one does.
+
+STEP = 0.00001
+
+
+@pytest.fixture
+def stepped(engine):
+    from dataclasses import replace
+
+    engine.instruments = {
+        symbol: replace(instrument, step_size=STEP, min_notional=5.0)
+        for symbol, instrument in engine.market.instruments().items()
+    }
+    return engine
+
+
+def _round_trip(engine, exit_at: str) -> None:
+    engine.store.put("cooldowns", {})               # re-entering the same coin is the point
+    approve(engine)
+    assert engine._consider(make_candidate(engine), engine.account_state())
+    position = engine.positions[0]
+    if exit_at == "scale_then_stop":
+        mark(engine, "BTCEUR", position.entry_price + position.r_unit * 1.05)
+        engine._manage_one(position)
+        assert position.scaled_out
+        mark(engine, "BTCEUR", position.stop * 0.999)
+    elif exit_at == "target":
+        mark(engine, "BTCEUR", position.target * 1.001)
+    else:
+        mark(engine, "BTCEUR", position.stop * 0.999)
+    engine._manage_one(position)
+    assert engine.positions == []
+
+
+def test_books_match_the_cash_across_round_trips_with_lot_steps(stepped):
+    """The regression. Exits floor to the lot step; without a write-off the realised total
+    drifted above the cash by the unsold slivers' cost, and the drawdown halt read the gap
+    as losses — a backtest hit the 20% halt on money that was never lost."""
+    start = stepped.config.starting_equity
+    for exit_at in ("target", "stop", "scale_then_stop"):
+        _round_trip(stepped, exit_at)
+        cash = stepped.broker.balances()["EUR"]
+        assert start + stepped.store.total_realized() == pytest.approx(cash, abs=1e-9)
+        assert stepped.account_state().equity == pytest.approx(cash, abs=1e-9)
+
+
+def test_dust_never_accumulates_past_one_lot_step(stepped):
+    for exit_at in ("target", "stop", "scale_then_stop"):
+        _round_trip(stepped, exit_at)
+        assert 0 <= stepped.broker.balances().get("BTC", 0.0) < STEP
+
+
+def test_a_final_exit_never_sells_coins_the_engine_did_not_buy(stepped):
+    """Only dust is swept. A holding worth selling on its own is not the engine's to sell."""
+    approve(stepped)
+    stepped._consider(make_candidate(stepped), stepped.account_state())
+    position = stepped.positions[0]
+    owned_by_hand = 0.001                           # ~58 EUR of BTC already in the account
+    stepped.broker._balances["BTC"] += owned_by_hand
+
+    mark(stepped, "BTCEUR", position.stop * 0.999)
+    stepped._manage_one(position)
+
+    assert stepped.positions == []
+    assert stepped.broker.balances()["BTC"] == pytest.approx(owned_by_hand, abs=STEP)
+
+
+def test_a_final_exit_asks_for_no_more_than_the_account_holds(stepped):
+    """Binance takes a buy's fee out of the coins received, so the account can hold a
+    little less than the position records. The exchange rejects an over-sized sell whole,
+    and a rejected exit is a stop that never fires."""
+    approve(stepped)
+    stepped._consider(make_candidate(stepped), stepped.account_state())
+    position = stepped.positions[0]
+    # A hair under the quantity the position records, floored to the step: what selling
+    # the recorded quantity asks for is then more than the account holds.
+    floored = int(position.qty / STEP) * STEP
+    stepped.broker._balances["BTC"] = floored - STEP / 10
+
+    real_sell = stepped.broker.sell
+
+    def strict_sell(symbol, qty):
+        from helm.venues.base import VenueError
+
+        if qty > stepped.broker.balances()["BTC"] + 1e-15:
+            raise VenueError("Account has insufficient balance for requested action.")
+        return real_sell(symbol, qty)
+
+    stepped.broker.sell = strict_sell
+    mark(stepped, "BTCEUR", position.stop * 0.999)
+    stepped._manage_one(position)
+
+    assert stepped.positions == []
+    assert stepped.store.closed_positions()[0]["exit_reason"] == "STOP"
+
+
+def test_a_short_fill_keeps_the_rest_of_the_position_open(stepped):
+    """A remainder worth selling is a short fill, not dust: it stays managed, not written off."""
+    approve(stepped)
+    stepped._consider(make_candidate(stepped), stepped.account_state())
+    position = stepped.positions[0]
+    real_sell = stepped.broker.sell
+    stepped.broker.sell = lambda symbol, qty: real_sell(symbol, qty * 0.5)
+
+    mark(stepped, "BTCEUR", position.stop * 0.999)
+    stepped._manage_one(position)
+
+    assert stepped.positions == [position]
+    assert position.qty > 0
+
+
 def test_scan_produces_rows_for_everything_considered(engine):
     engine.hunt()
     rows = engine.snapshot()["scan"]

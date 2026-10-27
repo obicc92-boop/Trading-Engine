@@ -219,3 +219,34 @@ def realise(position: Position, qty: float, price: float, fee: float) -> float:
     position.fees_paid += fee
     position.qty = max(0.0, position.qty - qty)
     return net
+
+
+def write_off(position: Position) -> float:
+    """Charge whatever a final exit could not sell to the trade, and close its books.
+
+    Exchanges sell in whole lot steps, so a final exit floors its quantity and leaves a
+    sliver of coin behind. `realise` charges only for what actually left, so without this
+    the booked result would sit above the cash in the account by that sliver's cost — trade
+    after trade, until a drawdown measured against it described money that was never lost.
+    The sliver itself stays in the account, and the next final exit in the same coin sells
+    it (`book_swept`).
+    """
+    if position.qty <= 0:
+        return 0.0
+    share = (position.qty / position.initial_qty) if position.initial_qty else 0.0
+    cost = position.entry_price * position.qty + position.entry_fee * share
+    position.realized_pnl -= cost
+    position.qty = 0.0
+    return -cost
+
+
+def book_swept(position: Position, qty: float, price: float, fee: float) -> float:
+    """Book dust left by earlier trades, sold alongside this trade's final exit.
+
+    Its cost was charged to the trade that left it behind (`write_off`), so everything it
+    fetches is result.
+    """
+    net = qty * price - fee
+    position.realized_pnl += net
+    position.fees_paid += fee
+    return net
