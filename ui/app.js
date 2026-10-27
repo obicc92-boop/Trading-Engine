@@ -85,15 +85,25 @@ let equityPoints = [];
 const seenEvents = new Set();
 
 const PHASES = {
-  idle: "idle", syncing: "checking the account", managing: "managing open positions",
-  scanning: "scanning the market", deciding: "weighing a setup",
+  idle: "idle", syncing: "checking the account", deciding: "reading the daily close",
   executing: "sending an order", waiting: "watching",
 };
 
 const MARKS = {
-  entry: "▲", win: "✓", loss: "✕", warn: "!", error: "!",
-  think: "◆", pass: "–", info: "·",
+  entry: "▲", win: "✓", loss: "✕", warn: "!", error: "!", info: "·",
 };
+
+const coinName = (symbol) => String(symbol || "").replace(/(EUR|USDT|USDC)$/, "");
+const day = (ms) => (ms ? new Date(ms).toISOString().slice(0, 10) : "—");
+
+function untilNext(state) {
+  const due = state.decided_day == null ||
+    state.decided_day < state.next_decision_at - 2 * 86400000;
+  if (due) return { text: "due now", fraction: 1 };
+  const left = Math.max(0, state.next_decision_at - Date.now());
+  const h = Math.floor(left / 3600000), m = Math.floor((left % 3600000) / 60000);
+  return { text: `in ${h}h ${String(m).padStart(2, "0")}m`, fraction: 1 - left / 86400000 };
+}
 
 function applyState(state) {
   snapshot = state;
@@ -119,17 +129,15 @@ function applyState(state) {
   tweenTo($("equity"), account.equity || 0, (v) => money(v));
   tweenTo($("cash"), account.cash || 0, (v) => money(v));
   $("peak").textContent = money(account.peak_equity);
-
-  const todayEl = $("today");
-  todayEl.textContent = signed(account.realized_today || 0);
-  todayEl.className = "num " + sign(account.realized_today || 0);
+  const symbols = state.doctrine?.universe?.symbols || [];
+  $("heldCount").textContent = `${(state.positions || []).length} of ${symbols.length}`;
 
   const ret = account.total_return_pct || 0;
   $("ringPct").textContent = signed(ret, 1) + "%";
   $("ringPct").className = "pct num " + sign(ret);
-  // The ring fills over a -25%..+25% span: at 100 EUR, that is the range where the
-  // difference between a good week and a bad one is actually visible.
-  const span = 25;
+  // The ring fills over a -50%..+50% span: a trend rule moves in big, slow steps, and a
+  // narrower span would sit pinned at full for most of a good year.
+  const span = 50;
   const fraction = Math.min(1, Math.abs(ret) / span);
   const arc = $("ringArc");
   arc.style.strokeDashoffset = String(326.7 * (1 - fraction));
@@ -139,72 +147,66 @@ function applyState(state) {
     `started at ${money(account.starting_equity)} ${quote} · ` +
     (state.cycle ? `cycle ${state.cycle}, last ${ago(state.last_cycle_at)}` : "starting");
 
-  /* risk meters */
-  const heat = account.open_risk || 0;
-  const heatLimit = account.heat_limit || 1;
-  $("heatText").textContent = `${money(heat)} / ${money(heatLimit)} ${quote}`;
-  const heatPct = Math.min(100, (heat / heatLimit) * 100);
-  const heatBar = $("heatBar");
-  heatBar.style.width = heatPct + "%";
-  heatBar.className = heatPct > 80 ? "hot" : "";
+  /* the rule */
+  const equity = account.equity || 0;
+  const invested = equity ? (account.invested || 0) / equity * 100 : 0;
+  $("investedText").textContent = `${money(account.invested)} ${quote} · ${money(invested, 0)}%`;
+  $("investedBar").style.width = Math.min(100, invested) + "%";
 
   const dd = (account.drawdown || 0) * 100;
-  const ddLimit = (state.doctrine?.halts?.max_drawdown || 0.2) * 100;
+  const ddLimit = (state.doctrine?.halts?.max_drawdown || 0.7) * 100;
   $("ddText").textContent = `${money(dd, 1)}% of ${money(ddLimit, 0)}%`;
   const ddBar = $("ddBar");
   ddBar.style.width = Math.min(100, (dd / ddLimit) * 100) + "%";
   ddBar.className = dd > ddLimit * 0.6 ? "hot" : "";
 
-  const maxEntries = state.doctrine?.sizing?.max_entries_per_day || 3;
-  const used = account.entries_today || 0;
-  $("entriesText").textContent = `${used} of ${maxEntries}`;
-  $("entryDots").innerHTML = Array.from({ length: maxEntries }, (_, i) =>
-    `<i class="${i < used ? "used" : ""}"></i>`).join("");
+  const next = untilNext(state);
+  $("nextText").textContent = `${next.text} · 00:00 UTC`;
+  $("nextBar").style.width = Math.min(100, next.fraction * 100) + "%";
 
   renderBlocks(state);
-  renderPositions(state.positions || [], quote);
-  renderScan(state.scan || []);
+  renderCoins(state.coins || [], state);
+  renderPositions(state.positions || [], quote, state.coins || []);
   renderNotices(state);
 }
 
 function renderBlocks(state) {
   const el = $("blocks");
   const blocks = state.blocks || [];
+  const rule = state.doctrine?.rule || {};
+  const sizing = state.doctrine?.sizing || {};
   if (!blocks.length) {
-    const slots = (state.doctrine?.sizing?.max_open_positions || 3) - (state.positions || []).length;
     el.innerHTML = `<div style="display:flex;align-items:center;gap:9px;font-size:13px">
         <span class="dot" style="color:var(--win)"></span>
-        <span>Clear to trade — ${slots} slot${slots === 1 ? "" : "s"} free.</span>
+        <span>Following the rule.</span>
       </div>
       <p class="muted" style="margin:10px 0 0;font-size:11.5px;line-height:1.6">
-        Risking ${((state.doctrine?.sizing?.risk_per_trade || 0) * 100).toFixed(1)}% per trade,
-        minimum score ${state.doctrine?.entries?.min_score ?? "—"},
-        minimum reward:risk ${state.doctrine?.entries?.min_reward_risk ?? "—"}.
+        Hold a coin while its daily close is above its ${rule.sma_days ?? 200}-day average;
+        sell it on a close below. Each purchase is
+        ${money((sizing.entry_fraction || 0.25) * 100, 0)}% of the account. Checked once a day,
+        at 00:00 UTC — nothing happens in between.
       </p>`;
     return;
   }
   el.innerHTML = blocks.map((reason) =>
     `<div style="display:flex;gap:9px;font-size:12.5px;margin-bottom:9px;align-items:flex-start">
        <span class="dot" style="color:var(--warn);margin-top:6px"></span>
-       <span>${esc(reason)}</span>
-     </div>`).join("");
+       <span>Not buying: ${esc(reason)}</span>
+     </div>`).join("") +
+    `<p class="muted" style="margin:4px 0 0;font-size:11.5px">A coin whose trend breaks is still sold.</p>`;
 }
 
 function renderNotices(state) {
   const notices = [];
   if (state.halted) {
     notices.push(`<div class="notice danger"><b>Halted.</b>
-      <span>${esc(state.halt_reason)} — no trading until this is cleared by hand.</span></div>`);
+      <span>${esc(state.halt_reason)} — no purchases until this is cleared by hand. Sales
+      still happen.</span></div>`);
   }
   if (state.synthetic) {
     notices.push(`<div class="notice warn"><b>Generated prices.</b>
       <span>The venue was unreachable or synthetic mode is on, so these are simulated
       markets. Nothing shown here reflects a real price and no result means anything.</span></div>`);
-  }
-  if (!state.config?.brain) {
-    notices.push(`<div class="notice warn"><b>No decision layer.</b>
-      <span>ANTHROPIC_API_KEY is unset, so every candidate is declined automatically and
-      nothing will ever be bought.</span></div>`);
   }
   if (state.last_error) {
     notices.push(`<div class="notice danger"><b>Last cycle failed.</b>
@@ -238,96 +240,109 @@ function pushLine(event, animate = true) {
   $("feedCount").textContent = String(feed.children.length);
 }
 
-/* ---------- positions ---------- */
-function renderPositions(positions, quote) {
+/* ---------- the four coins ----------
+   Each coin against its average. The gauge is centred on the average: right of centre is
+   above it (held, or bought at the next close), left is below (cash). The verdict that
+   counts is the one at the close; where the price is now is shown for interest only. */
+function gauge(distance, span = 0.3) {
+  if (distance === null || distance === undefined) return "";
+  const x = Math.max(-1, Math.min(1, distance / span)) * 50;
+  const left = x >= 0 ? 50 : 50 + x;
+  return `<div class="gauge">
+      <div class="fill ${x >= 0 ? "up" : "down"}" style="left:${left}%;width:${Math.abs(x)}%"></div>
+      <div class="mid"></div>
+    </div>`;
+}
+
+function renderCoins(rows, state) {
+  const el = $("coins");
+  const decided = rows.find((r) => r.day != null);
+  $("coinDay").textContent = decided ? `close of ${day(decided.day)}` : "—";
+  if (!rows.length) { el.innerHTML = `<div class="empty">waiting for the first daily close…</div>`; return; }
+
+  el.innerHTML = rows.map((row) => {
+    const known = row.on !== null && row.on !== undefined;
+    const state = !known ? "no verdict yet"
+      : row.on ? (row.held ? "above · held" : "above · buys at the close")
+      : (row.held ? "below · sells at the close" : "below · cash");
+    const digits = row.price > 100 ? 2 : 4;
+    return `<div class="coin" data-on="${known ? row.on : ""}">
+      <div class="top">
+        <span class="sym">${esc(coinName(row.symbol))}</span>
+        <span class="state">${esc(state)}</span>
+      </div>
+      <div class="price num">${money(row.price, digits)}</div>
+      ${known ? gauge(row.distance) : ""}
+      ${known ? `<div class="foot num">
+          <span>close <b class="${sign(row.distance)}">${signed(row.distance * 100, 1)}%</b></span>
+          <span>now <b class="${sign(row.now_distance)}">${row.now_distance == null ? "—" : signed(row.now_distance * 100, 1) + "%"}</b></span>
+          <span>avg ${money(row.average, digits)}</span>
+        </div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+/* ---------- held coins ---------- */
+function renderPositions(positions, quote, coins) {
   const el = $("positions");
   $("posCount").textContent = String(positions.length);
   if (!positions.length) {
-    el.innerHTML = `<div class="empty"><div class="big">Flat</div>No money at risk right now.</div>`;
+    el.innerHTML = `<div class="empty"><div class="big">All cash</div>No coin is above its average and held.</div>`;
     return;
   }
 
   el.innerHTML = positions.map((p) => {
-    // The rail is drawn to scale between the stop and the target, so the marker's position
-    // is a literal picture of where the trade stands rather than a decorative bar.
-    const low = Math.min(p.stop, p.entry_price, p.price);
-    const high = Math.max(p.target, p.price, p.entry_price);
-    const span = high - low || 1;
-    const at = (v) => ((v - low) / span) * 100;
+    const coin = coins.find((c) => c.symbol === p.symbol) || {};
+    const average = coin.average;
+    // Drawn to scale between the average (the line a close must stay above) and the highest
+    // of entry and now, so the gap between the price and the exit is literal.
+    const points = [p.entry_price, p.price, average].filter((v) => v);
+    const low = Math.min(...points), high = Math.max(...points);
+    const pad = (high - low) * 0.12 || high * 0.02;
+    const at = (v) => ((v - (low - pad)) / ((high + pad) - (low - pad))) * 100;
+    const held = Math.max(0, (Date.now() - p.opened_at) / 86400000);
 
-    const pnlClass = sign(p.unrealized);
     return `<div class="position">
       <div class="head">
-        <span class="sym">${esc(p.symbol)}</span>
-        <span class="setup">${esc((p.setup || "").replace(/_/g, " ").toLowerCase())}</span>
+        <span class="sym">${esc(coinName(p.symbol))}</span>
+        <span class="setup">held ${held < 1 ? "today" : money(held, 0) + "d"}</span>
         <div class="pnl">
-          <div class="big num ${pnlClass}">${signed(p.unrealized)} ${esc(quote)}</div>
-          <div class="r num">${signed(p.r_multiple, 2)}R · ${signed(p.unrealized_pct, 2)}%</div>
+          <div class="big num ${sign(p.unrealized)}">${signed(p.unrealized)} ${esc(quote)}</div>
+          <div class="r num">${signed(p.unrealized_pct, 1)}% on ${money(p.cost)}</div>
         </div>
       </div>
 
-      <div class="track">
+      ${average ? `<div class="track">
         <div class="rail">
-          <div class="risk" style="left:${at(p.stop)}%;width:${at(p.entry_price) - at(p.stop)}%"></div>
-          <div class="reward" style="left:${at(p.entry_price)}%;width:${at(p.target) - at(p.entry_price)}%"></div>
+          <div class="cushion" style="left:${at(average)}%;width:${Math.max(0, at(p.price) - at(average))}%"></div>
         </div>
-        <div class="tick stop" style="left:${at(p.stop)}%"></div>
+        <div class="tick avg" style="left:${at(average)}%"></div>
         <div class="tick entry" style="left:${at(p.entry_price)}%"></div>
-        <div class="tick target" style="left:${at(p.target)}%"></div>
         <div class="now" style="left:${at(p.price)}%"></div>
-        <div class="lbl" style="left:${at(p.stop)}%">stop</div>
-        <div class="lbl" style="left:${at(p.target)}%">target</div>
-      </div>
+        <div class="lbl" style="left:${at(average)}%">average</div>
+        <div class="lbl" style="left:${at(p.entry_price)}%">bought</div>
+      </div>` : ""}
 
       <div class="meta">
-        <span>size <b class="num">${money(p.notional)} ${esc(quote)}</b></span>
-        <span>entry <b class="num">${money(p.entry_price, 6)}</b></span>
-        <span>now <b class="num">${money(p.price, 6)}</b></span>
-        <span>at risk <b class="num">${money(Math.max(0, (p.entry_price - p.stop) * p.qty))}</b></span>
-        <span>held <b>${ago(p.opened_at).replace(" ago", "")}</b></span>
-        ${p.scaled_out ? `<span style="color:var(--win)">half banked</span>` : ""}
+        <span>worth <b class="num">${money(p.value)} ${esc(quote)}</b></span>
+        <span>bought <b class="num">${money(p.entry_price, p.entry_price > 100 ? 2 : 4)}</b></span>
+        <span>now <b class="num">${money(p.price, p.price > 100 ? 2 : 4)}</b></span>
+        ${average ? `<span>sold on a close below <b class="num">${money(average, average > 100 ? 2 : 4)}</b></span>` : ""}
       </div>
-
-      ${p.thesis ? `<div class="thesis">${esc(p.thesis)}</div>` : ""}
       ${p.last_note ? `<div class="note">${esc(p.last_note)}</div>` : ""}
-      <div class="act"><button class="ctl danger" data-close="${esc(p.id)}">Close now</button></div>
+      <div class="act"><button class="ctl danger" data-close="${esc(p.id)}">Sell now</button></div>
     </div>`;
   }).join("");
 
   el.querySelectorAll("[data-close]").forEach((button) => {
     button.onclick = async () => {
-      if (!confirm("Sell this position at market, right now?")) return;
+      if (!confirm("Sell this coin at market, right now? The rule will buy it back at the next " +
+                   "daily close if it is still above its average — pause first to stop that.")) return;
       button.disabled = true;
       try { await api(`/api/control/close/${button.dataset.close}`, { method: "POST" }); }
       catch (e) { alert(e.message); button.disabled = false; }
     };
   });
-}
-
-/* ---------- scanner ---------- */
-function renderScan(rows) {
-  const el = $("scan");
-  $("scanCount").textContent = String(rows.length);
-  if (!rows.length) { el.innerHTML = `<div class="empty">first scan pending…</div>`; return; }
-
-  const minScore = snapshot?.doctrine?.entries?.min_score || 62;
-  el.innerHTML = rows.map((row) => {
-    const score = row.score || 0;
-    const hot = score >= minScore;
-    return `<div class="chip ${hot ? "hot" : ""}" data-regime="${esc(row.regime)}">
-      <div class="top">
-        <span class="sym">${esc(row.symbol)}</span>
-        <span class="chg num ${sign(row.change_24h)}">${signed(row.change_24h, 1)}%</span>
-      </div>
-      <div class="regime"><i></i>${esc((row.regime || "").replace(/_/g, " ").toLowerCase())}</div>
-      <div class="score-row">
-        <span class="num">${score ? money(score, 0) : "–"}</span>
-        <span class="bar"><i class="${hot ? "good" : ""}" style="width:${Math.min(100, score)}%"></i></span>
-        <span>RSI ${money(row.rsi, 0)}</span>
-      </div>
-      <div class="price num">${money(row.price, row.price > 100 ? 2 : 5)}</div>
-    </div>`;
-  }).join("");
 }
 
 /* ---------- equity chart ---------- */
@@ -409,10 +424,11 @@ function renderTrades(rows, stats) {
 
   $("stats").innerHTML = [
     ["Trades", stats.trades],
-    ["Win rate", stats.trades ? money(stats.win_rate, 0) + "%" : "—"],
-    ["Expectancy", stats.trades ? signed(stats.expectancy_r, 2) + "R" : "—"],
-    ["Profit factor", stats.profit_factor ? money(stats.profit_factor, 2) : "—"],
+    ["Won", stats.trades ? money(stats.win_rate, 0) + "%" : "—"],
+    ["Average", stats.trades ? signed(stats.avg_return_pct, 1) + "%" : "—"],
     ["Total P&L", signed(stats.total_pnl) + " " + quote],
+    ["Fees", money(stats.fees)],
+    ["Days held", stats.trades ? money(stats.avg_days_held, 0) : "—"],
     ["Best", signed(stats.best)],
     ["Worst", signed(stats.worst)],
   ].map(([k, v]) => {
@@ -425,50 +441,49 @@ function renderTrades(rows, stats) {
   if (!rows.length) { el.innerHTML = `<div class="empty">No closed trades yet.</div>`; return; }
 
   el.innerHTML = `<table><thead><tr>
-      <th>Closed</th><th>Symbol</th><th>Setup</th><th>Exit</th>
-      <th class="r">Entry</th><th class="r">Exit</th><th class="r">R</th><th class="r">P&L</th>
+      <th>Sold</th><th>Coin</th><th>Why</th><th class="r">Days</th>
+      <th class="r">Bought</th><th class="r">Sold</th><th class="r">Return</th><th class="r">P&L</th>
     </tr></thead><tbody>${rows.map((t) => `<tr>
-      <td class="muted num">${t.closed_at ? clock(t.closed_at) : "—"}</td>
-      <td><b>${esc(t.symbol)}</b></td>
-      <td class="muted">${esc((t.setup || "").replace(/_/g, " ").toLowerCase())}</td>
-      <td class="muted">${esc((t.exit_reason || "").replace(/_/g, " ").toLowerCase())}</td>
-      <td class="r num">${money(t.entry_price, 6)}</td>
-      <td class="r num">${money(t.exit_price, 6)}</td>
-      <td class="r num ${sign(t.r_multiple)}">${signed(t.r_multiple, 2)}</td>
+      <td class="muted num">${day(t.closed_at)}</td>
+      <td><b>${esc(coinName(t.symbol))}</b></td>
+      <td class="muted">${esc({ TREND_OFF: "closed below average", MANUAL: "sold by hand",
+        FLATTENED: "flattened", EXTERNALLY_CLOSED: "left the account" }[t.exit_reason]
+        || (t.exit_reason || "").replace(/_/g, " ").toLowerCase())}</td>
+      <td class="r num">${money(((t.closed_at || 0) - (t.opened_at || 0)) / 86400000, 0)}</td>
+      <td class="r num">${money(t.entry_price, t.entry_price > 100 ? 2 : 4)}</td>
+      <td class="r num">${money(t.exit_price, t.exit_price > 100 ? 2 : 4)}</td>
+      <td class="r num ${sign(t.return_pct)}">${signed(t.return_pct, 1)}%</td>
       <td class="r num ${sign(t.realized_pnl)}">${signed(t.realized_pnl)}</td>
     </tr>`).join("")}</tbody></table>`;
 }
 
 /* ---------- decisions ---------- */
+const ACTIONS = {
+  BUY: ["bought", "go"], SELL: ["sold", "sell"], HOLD: ["held", "hold"], STAY_OUT: ["no trade", "no"],
+  BUY_FAILED: ["buy failed", "fail"], SELL_FAILED: ["sale failed", "fail"],
+};
+
 function renderDecisions(rows) {
   const el = $("decisions");
-  if (!rows.length) { el.innerHTML = `<div class="empty">Nothing has reached the desk yet.</div>`; return; }
+  if (!rows.length) { el.innerHTML = `<div class="empty">No daily close has been read yet.</div>`; return; }
 
-  el.innerHTML = rows.map((d) => {
-    const candidate = d.candidate || {};
-    const factors = candidate.factors || {};
-    const taken = d.go && d.position_id;
-    return `<div class="decision">
-      <div class="head">
-        <span class="verdict ${taken ? "go" : "no"}">${taken ? "taken" : "passed"}</span>
-        <b>${esc(d.symbol)}</b>
-        <span class="muted">${esc((d.setup || "").replace(/_/g, " ").toLowerCase())}</span>
-        <span class="muted num">score ${money(d.score, 0)}</span>
-        ${d.conviction ? `<span class="muted num">conviction ${d.conviction}</span>` : ""}
-        ${d.source === "fallback" ? `<span class="muted">(no verdict available)</span>` : ""}
-        <span class="when">${clock(d.ts)}</span>
-      </div>
-      ${d.thesis ? `<div class="thesis">${esc(d.thesis)}</div>` : ""}
-      ${d.blocked_by && d.blocked_by !== "declined"
-        ? `<div class="inval"><b>Blocked:</b> ${esc(d.blocked_by)}</div>` : ""}
-      ${d.invalidation ? `<div class="inval"><b>Watching for:</b> ${esc(d.invalidation)}</div>` : ""}
-      ${Object.keys(factors).length ? `<div class="factors">${Object.entries(factors).map(([k, v]) =>
-        `<div class="factor">
-           <div class="k">${esc(k.replace(/_/g, " "))}</div>
-           <div class="bar"><i style="width:${Math.min(100, v * 100)}%"></i></div>
-         </div>`).join("")}</div>` : ""}
-    </div>`;
-  }).join("");
+  el.innerHTML = `<table><thead><tr>
+      <th>Close of</th><th>Coin</th><th>Verdict</th><th class="r">Close</th><th class="r">Average</th>
+      <th class="r">Distance</th><th>Action</th><th>Note</th>
+    </tr></thead><tbody>${rows.map((d) => {
+      const [label, cls] = ACTIONS[d.action] || [d.action, "no"];
+      const digits = d.close > 100 ? 2 : 4;
+      return `<tr>
+        <td class="muted num">${day(d.day)}</td>
+        <td><b>${esc(coinName(d.symbol))}</b></td>
+        <td class="${d.on ? "pos" : "neg"}">${d.on ? "above" : "below"}</td>
+        <td class="r num">${money(d.close, digits)}</td>
+        <td class="r num">${money(d.average, digits)}</td>
+        <td class="r num ${sign(d.distance)}">${signed(d.distance * 100, 1)}%</td>
+        <td><span class="verdict ${cls}">${esc(label)}</span></td>
+        <td class="muted" style="font-size:11.5px">${esc(d.note)}</td>
+      </tr>`;
+    }).join("")}</tbody></table>`;
 }
 
 /* ---------- doctrine ----------
@@ -552,8 +567,7 @@ function connect() {
     const event = JSON.parse(message.data);
     if (event.kind === "state") applyState(event.data);
     else if (event.kind === "narrate") pushLine(event);
-    else if (event.kind === "scan") renderScan(event.data);
-    else if (event.kind === "position_closed" || event.kind === "position_opened") refreshSlow();
+    else if (["position_closed", "position_opened", "decision"].includes(event.kind)) refreshSlow();
   };
 
   socket.onclose = (event) => {
@@ -585,8 +599,9 @@ $("pauseBtn").onclick = async () => {
 
 $("flattenBtn").onclick = async () => {
   const open = snapshot?.positions?.length || 0;
-  if (!open) { alert("Nothing to flatten — no open positions."); return; }
-  if (!confirm(`Sell all ${open} position(s) at market immediately?`)) return;
+  if (!open) { alert("Nothing to flatten — nothing held."); return; }
+  if (!confirm(`Sell all ${open} coin(s) at market immediately? Purchases are paused ` +
+               `afterwards, so the rule does not buy straight back in.`)) return;
   try { await api("/api/control/flatten", { method: "POST" }); } catch (e) { alert(e.message); }
 };
 

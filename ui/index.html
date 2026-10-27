@@ -14,7 +14,7 @@
   <header class="top">
     <div class="brand">
       <h1>HELM</h1>
-      <span class="tag">autonomous desk</span>
+      <span class="tag">daily trend rule</span>
     </div>
     <span class="pill dry" id="modePill"><i class="dot"></i><span id="modeText">connecting</span></span>
     <span class="pill" id="venuePill" hidden></span>
@@ -63,32 +63,39 @@
           <div class="value num"><span id="equity">—</span><span class="cur" id="quoteCur"></span></div>
           <div class="sub" id="equitySub">waiting for the first cycle</div>
           <div class="row">
-            <div><span>Today</span><b class="num" id="today">—</b></div>
-            <div><span>Free cash</span><b class="num" id="cash">—</b></div>
+            <div><span>Coins held</span><b class="num" id="heldCount">—</b></div>
+            <div><span>Cash</span><b class="num" id="cash">—</b></div>
             <div><span>Peak</span><b class="num" id="peak">—</b></div>
           </div>
         </div>
       </div>
 
       <div class="panel">
-        <h2>Risk right now</h2>
+        <h2>The rule</h2>
         <div class="meter">
-          <div class="head"><span>Portfolio heat</span><b class="num" id="heatText">—</b></div>
-          <div class="bar"><i id="heatBar" style="width:0%"></i></div>
+          <div class="head"><span>Invested</span><b class="num" id="investedText">—</b></div>
+          <div class="bar"><i id="investedBar" style="width:0%"></i></div>
         </div>
         <div class="meter">
           <div class="head"><span>Drawdown from peak</span><b class="num" id="ddText">—</b></div>
           <div class="bar"><i id="ddBar" style="width:0%"></i></div>
         </div>
         <div class="meter">
-          <div class="head"><span>Entries used today</span><b class="num" id="entriesText">—</b></div>
-          <div class="dots" id="entryDots"></div>
+          <div class="head"><span>Next decision</span><b class="num" id="nextText">—</b></div>
+          <div class="bar"><i id="nextBar" style="width:0%"></i></div>
         </div>
       </div>
 
       <div class="panel">
         <h2>Standing orders</h2>
         <div id="blocks"></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:14px">
+      <h2>The four coins <span class="count" id="coinDay">—</span></h2>
+      <div class="coin-grid" id="coins">
+        <div class="empty">waiting for the first daily close…</div>
       </div>
     </div>
 
@@ -101,9 +108,9 @@
       </div>
 
       <div class="panel">
-        <h2>Open positions <span class="count" id="posCount">0</span></h2>
+        <h2>Held <span class="count" id="posCount">0</span></h2>
         <div id="positions">
-          <div class="empty"><div class="big">Flat</div>No money at risk right now.</div>
+          <div class="empty"><div class="big">All cash</div>No coin is above its average and held.</div>
         </div>
       </div>
     </div>
@@ -116,12 +123,6 @@
       </div>
     </div>
 
-    <div class="panel" style="margin-top:14px">
-      <h2>Market scan <span class="count" id="scanCount">0</span></h2>
-      <div class="scan-grid" id="scan">
-        <div class="empty">first scan pending…</div>
-      </div>
-    </div>
   </section>
 
   <!-- ===================== TRADES ===================== -->
@@ -141,10 +142,10 @@
     <div class="panel">
       <h2>Decision log</h2>
       <p class="muted" style="margin:-6px 0 16px;font-size:12.5px">
-        Every setup that reached the desk, including the ones I turned down — which is most
-        of them, and the more useful half of the record.
+        Every coin at every daily close: the close, its 200-day average, and what the rule did
+        about it — including the days it did nothing, which is most of them.
       </p>
-      <div id="decisions"><div class="empty">Nothing has reached the desk yet.</div></div>
+      <div id="decisions"><div class="empty">No daily close has been read yet.</div></div>
     </div>
   </section>
 

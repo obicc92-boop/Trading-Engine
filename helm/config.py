@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import doctrine
+
 try:  # optional: handy locally, unnecessary in a container with real env vars
     from dotenv import load_dotenv
 
@@ -40,11 +42,6 @@ def _int(name: str, default: int) -> int:
         return default
 
 
-def _csv(name: str, default: str = "") -> list[str]:
-    raw = os.getenv(name, default) or ""
-    return [item.strip().upper() for item in raw.split(",") if item.strip()]
-
-
 @dataclass(slots=True)
 class Config:
     # -- execution posture ---------------------------------------------------------------
@@ -55,21 +52,14 @@ class Config:
     live_ack: bool = field(default_factory=lambda: _bool("I_UNDERSTAND_REAL_MONEY"))
 
     venue: str = field(default_factory=lambda: os.getenv("HELM_VENUE", "binance").strip().lower())
-    quote: str = field(default_factory=lambda: os.getenv("HELM_QUOTE", "EUR").strip().upper())
+    # Which coins, and against what, is doctrine: the rule was tested on those pairs only.
+    quote: str = doctrine.QUOTE
 
     # -- credentials ---------------------------------------------------------------------
     binance_key: str = field(default_factory=lambda: os.getenv("BINANCE_API_KEY", "").strip())
     binance_secret: str = field(default_factory=lambda: os.getenv("BINANCE_API_SECRET", "").strip())
     binance_base: str = field(
         default_factory=lambda: os.getenv("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/")
-    )
-    alpaca_key: str = field(default_factory=lambda: os.getenv("ALPACA_API_KEY", "").strip())
-    alpaca_secret: str = field(default_factory=lambda: os.getenv("ALPACA_API_SECRET", "").strip())
-    alpaca_base: str = field(
-        default_factory=lambda: os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets").rstrip("/")
-    )
-    alpaca_data_base: str = field(
-        default_factory=lambda: os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
     )
 
     telegram_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
@@ -79,18 +69,8 @@ class Config:
     )
     telegram_commands: bool = field(default_factory=lambda: _bool("TELEGRAM_COMMANDS", True))
 
-    anthropic_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", "").strip())
-    model: str = field(default_factory=lambda: os.getenv("HELM_MODEL", "claude-opus-5").strip())
-    model_effort: str = field(default_factory=lambda: os.getenv("HELM_MODEL_EFFORT", "high").strip())
-
-    # -- universe ------------------------------------------------------------------------
-    # Empty means "rank the venue's own liquid symbols". Setting it pins the universe,
-    # which is what you want while you're still watching it closely.
-    symbols: list[str] = field(default_factory=lambda: _csv("HELM_SYMBOLS"))
-
     # -- loop ----------------------------------------------------------------------------
     cycle_seconds: int = field(default_factory=lambda: _int("HELM_CYCLE_SECONDS", 60))
-    scan_every_cycles: int = field(default_factory=lambda: _int("HELM_SCAN_EVERY", 5))
     starting_equity: float = field(default_factory=lambda: _float("HELM_STARTING_EQUITY", 100.0))
     taker_fee: float = field(default_factory=lambda: _float("HELM_TAKER_FEE", 0.001))
 
@@ -123,10 +103,6 @@ class Config:
         return not self.ui_token
 
     @property
-    def brain_enabled(self) -> bool:
-        return bool(self.anthropic_key)
-
-    @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_token and self.telegram_chat_id)
 
@@ -146,16 +122,11 @@ class Config:
             "venue": self.venue,
             "quote": self.quote,
             "cycle_seconds": self.cycle_seconds,
-            "brain": self.brain_enabled,
-            "model": self.model if self.brain_enabled else None,
             "telegram": self.telegram_enabled,
             "keys_present": {
                 "binance": bool(self.binance_key and self.binance_secret),
-                "alpaca": bool(self.alpaca_key and self.alpaca_secret),
-                "anthropic": bool(self.anthropic_key),
                 "telegram": self.telegram_enabled,
             },
-            "pinned_symbols": self.symbols,
         }
 
 

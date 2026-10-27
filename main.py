@@ -49,6 +49,8 @@ def main() -> int:
 
 
 def banner(config, engine) -> None:
+    from helm import doctrine
+
     mode = "LIVE — REAL MONEY" if config.live else "DRY RUN — simulated fills"
     print("\n" + "=" * 62)
     print("  HELM")
@@ -56,7 +58,8 @@ def banner(config, engine) -> None:
     print(f"  Mode        {mode}")
     print(f"  Venue       {engine.market.name}" + ("  (generated prices)" if engine.synthetic else ""))
     print(f"  Quote       {config.quote}")
-    print(f"  Decisions   {config.model if config.brain_enabled else 'DISABLED — no API key, nothing will be bought'}")
+    print(f"  Rule        hold {', '.join(s[:-len(doctrine.QUOTE)] for s in doctrine.SYMBOLS)} while the "
+          f"daily close is above the {doctrine.SMA_DAYS}-day average  (doctrine v{doctrine.VERSION})")
     print(f"  Dashboard   http://{config.host}:{config.port}")
     if config.mode == "live" and not config.live:
         print("\n  !! HELM_MODE=live but this is running DRY, because:")

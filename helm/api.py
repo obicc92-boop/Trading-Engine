@@ -197,24 +197,26 @@ def _performance(engine) -> dict:
     """Trade statistics, computed from closed positions only.
 
     Open positions are excluded on purpose: counting unrealised gains as performance is the
-    most common way a trading record flatters itself.
+    most common way a trading record flatters itself. With a trend rule that matters more
+    than usual — most of the result sits in a few long holds, open until the trend breaks.
     """
     closed = engine.store.all_closed()
     if not closed:
         return {
-            "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "expectancy_r": 0.0,
+            "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "avg_return_pct": 0.0,
             "avg_win": 0.0, "avg_loss": 0.0, "profit_factor": 0.0, "best": 0.0,
-            "worst": 0.0, "total_pnl": 0.0, "by_setup": {},
+            "worst": 0.0, "total_pnl": 0.0, "fees": 0.0, "avg_days_held": 0.0, "by_symbol": {},
         }
 
     pnls = [row.get("realized_pnl") or 0.0 for row in closed]
-    rs = [row.get("r_multiple") or 0.0 for row in closed]
+    returns = [row.get("return_pct") or 0.0 for row in closed]
     wins = [value for value in pnls if value > 0]
     losses = [value for value in pnls if value <= 0]
+    days = [((row.get("closed_at") or 0) - (row.get("opened_at") or 0)) / 86_400_000 for row in closed]
 
-    by_setup: dict[str, dict] = {}
+    by_symbol: dict[str, dict] = {}
     for row in closed:
-        bucket = by_setup.setdefault(row["setup"], {"trades": 0, "pnl": 0.0, "wins": 0})
+        bucket = by_symbol.setdefault(row["symbol"], {"trades": 0, "pnl": 0.0, "wins": 0})
         bucket["trades"] += 1
         bucket["pnl"] += row.get("realized_pnl") or 0.0
         bucket["wins"] += 1 if (row.get("realized_pnl") or 0) > 0 else 0
@@ -225,12 +227,14 @@ def _performance(engine) -> dict:
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": len(wins) / len(closed) * 100,
-        "expectancy_r": sum(rs) / len(rs),
+        "avg_return_pct": sum(returns) / len(returns),
         "avg_win": (sum(wins) / len(wins)) if wins else 0.0,
         "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
         "profit_factor": (sum(wins) / gross_loss) if gross_loss > 0 else 0.0,
         "best": max(pnls),
         "worst": min(pnls),
         "total_pnl": sum(pnls),
-        "by_setup": by_setup,
+        "fees": sum(row.get("fees_paid") or 0.0 for row in closed),
+        "avg_days_held": sum(days) / len(days),
+        "by_symbol": by_symbol,
     }

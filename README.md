@@ -2,22 +2,27 @@
 
 [![CI](https://github.com/obicc92-boop/Trading-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/obicc92-boop/Trading-Engine/actions/workflows/ci.yml)
 
-An autonomous trading desk for a small real-money account. It scans the market, analyses
-what it finds, decides whether anything is worth buying, sizes the position from risk rather
-than conviction, and manages the exit. It reports what it is doing in plain language while
-it does it.
+A trading engine for a small real-money account. It holds BTC, ETH, SOL and XRP while each
+one's daily close is above its 200-day average, and holds euros instead when it is not. It
+checks once a day, just after the daily candle closes at 00:00 UTC, and reports what it is
+doing in plain language while it does it.
 
-Built for **€100**. That constraint drives every design decision here, and most of what a
-larger account would do is wrong at this size.
+Built for **€100**. That constraint drove the design: at this size fees decide the result,
+so the rule trades rarely.
 
 ```
-scan  →  analyse  →  decide  →  size  →  execute  →  manage  →  exit
+daily close  →  above or below the average  →  sell what broke  →  buy what turned on
 ```
 
-**[The Doctrine](DOCTRINE.md) is the specification.** It states the rules — the universe,
-the risk limits, the entries, the exits, the circuit breakers — in prose, and every number
-in it appears in `helm/doctrine.py` and is enforced at runtime. Read that first. This file
-only explains how to run the thing.
+**[The Doctrine](DOCTRINE.md) is the specification.** It states the rule — the coins, the
+average, the sizing, the halt — in prose, says what to expect including how bad it can get,
+and every number in it appears in `helm/doctrine.py`. Read that first. This file only
+explains how to run the thing.
+
+Version 1 traded short-term setups on hourly charts with a language model approving each
+entry. Its own backtest ended it: −10.2% over six months while holding the same coins made
++11%, and the model's picks were no better than chance. The doctrine's section 0 has the
+detail; the code is in the git history.
 
 ---
 
@@ -29,31 +34,29 @@ included.
 
 What is genuinely true about it:
 
-- Risk per trade is capped at 2% of equity and enforced in three independent places.
-- Position size is derived from stop distance. Nothing can choose a size directly.
-- The decision layer can only ever make a position *smaller* or a stop *tighter*.
-- Every loss limit halts new entries automatically. A 20% drawdown halts everything.
-- Every decision, including every refusal, is recorded with its reasoning.
+- The rule is mechanical and tested: the engine itself, replaying daily Binance history,
+  reproduces the research behind it (see [Backtesting](#backtesting)).
+- Purchases are a quarter of the account each, never added to. Nothing can choose a size.
+- Sales are never blocked — not by a pause, not by the halt.
+- A 70% drop from peak equity halts purchases until a human clears it.
+- Every daily decision, including the days nothing happened, is recorded with the close and
+  the average it was compared with.
 
 What is **not** true about it:
 
-- It has no record of making money. A backtest of the rules alone — no decision layer —
-  over April to October 2026 on BTC, ETH, SOL and XRP lost 10.2% while simply holding the
-  same four coins made 11%. Before fees its 140 trades came out about even (−€0.53); the
-  €9.63 paid in fees is nearly all of the loss. See [Backtesting](#backtesting).
+- It does not make money often. In testing only one trade in four or five was profitable;
+  the result came from a few trends held for months. Weeks of small losses are normal.
+- It does not protect you from a crash inside a day. It looks once a day, so a coin can fall
+  20–30% before the next close says sell. The worst drop in eight years of testing was 63%.
+- Past results are not a forecast. Crypto has a short history and only a few full cycles.
   The synthetic market in this repo is a rendering aid, not a simulation of anything.
-- Stops are not guarantees. In a fast market a stop becomes a market order and fills where
-  it fills.
-- If the process dies or the exchange goes down, open positions are unmanaged until it
-  comes back. It reconciles against the exchange on recovery, but it cannot manage what it
-  cannot reach.
-- The setups are historically sound patterns, not predictions. Regimes change faster than
-  any rulebook adapts, and a long run of losses inside the rules is a normal outcome.
+- If the process dies or the exchange goes down, the decision waits until it is back. It
+  reconciles against the exchange on recovery and acts on the latest close.
 
-**Run it in `dry` mode for at least a week before going live.** Dry mode runs the identical
-code path against real market data with simulated fills — same sizing, same rails, same
-exits. The only substituted component is the one that moves money. If you would not have
-been happy with that week, you have learned something for free.
+**Run it in `dry` mode first.** Dry mode runs the identical code path against real market
+data with simulated fills — same rule, same sizing, same books. The only substituted
+component is the one that moves money. With trades this rare, a dry run proves the engine
+behaves, not that the rule makes money; the backtest is the evidence for that.
 
 ---
 
@@ -67,10 +70,9 @@ python main.py
 
 The dashboard is at `http://localhost:8000`.
 
-With no configuration at all it starts in dry mode, pulls real Binance market data, and
-buys nothing — because with no `ANTHROPIC_API_KEY` there is no decision layer, and a
-candidate with no verdict is declined. That is the intended default: a fresh clone watches
-the market and does nothing.
+With no configuration at all it starts in dry mode on real Binance market data. On its first
+cycle it reads the latest daily close and buys, with simulated money, every coin that closed
+above its average — the rule does not wait for a coin to cross; it holds whatever is above.
 
 ### Check the environment before trusting it
 
@@ -79,40 +81,28 @@ python main.py doctor
 ```
 
 Run this **on the machine that will actually trade**. It verifies venue reachability, that
-your credentials work, that the balance exists, that candles are flowing and that the
-decision layer responds. It never places an order. Fix everything it calls a problem before
-going near live mode.
+your credentials work, that the balance exists, and that each coin has the 200 closed days
+the rule needs — printing where each one stands against its average. It never places an
+order. Fix everything it calls a problem before going near live mode.
 
 ### What to look for during the dry run
 
-A dry run is only useful if you know what you are grading. After a few days, open the
-dashboard and check these, in order — the first three are about the machine, the last three
-about the strategy.
+The rule acts once a day, so a dry run is mostly about the machine. After a few days:
 
 **Is it healthy?**
-- The **Live** tab's narration should show a steady cycle. Long silences mean it is stuck.
+- The **Live** tab shows a cycle every minute, and "Next decision" counts down to 00:00 UTC.
+- A "Read the … close" line in the narration every day, and one Telegram message a day.
 - No red "last cycle failed" banner.
-- Open positions should show a stop that moves *up* over time and never down.
 
-**Is it behaving?**
-- Entries per day never exceeds 3, open positions never exceeds 3.
-- On the **Trades** tab, no single loss should be much worse than ~1R. A −2R trade means a
-  stop did not hold and is worth investigating.
-- Holds measured in hours to days, not minutes. Minutes means something is cutting trades
-  early.
+**Is it following the rule?**
+- On the **Decisions** tab, every coin has a row for every day. Each "bought" is a coin that
+  closed above its average and was not held; each "sold" one that closed below.
+- Nothing bought or sold except in the first minutes after midnight UTC (or on first start).
+- Each purchase is about a quarter of the account at the time.
 
-**Is it any good?** This is the part that needs patience and the part the dry run mostly
-cannot answer yet.
-- Ten trades tell you almost nothing. Thirty start to mean something. The doctrine is
-  selective by design, so a few days may produce only a handful.
-- Read the **Decisions** tab, especially the refusals. The theses are the real output: if
-  the reasoning is sound but the trades lose, the edge is missing. If the reasoning is
-  sloppy, the problem is upstream of the market.
-- Expectancy in R matters more than win rate. A 40% win rate with +0.4R expectancy is a
-  good system; a 70% win rate with −0.1R expectancy is a slow bleed.
-
-If the dry week would have annoyed you, do not fund it. That is the entire point of running
-one.
+**Is it any good?** A week cannot say. The rule trades about three times a month and most
+trades lose; the result comes from the occasional trend held for months. The backtest is the
+evidence, and the doctrine's section 5 says what to expect.
 
 ### Soak testing
 
@@ -120,11 +110,12 @@ one.
 python tools/soak.py --days 30
 ```
 
-Runs the equivalent of a month of continuous operation in a couple of minutes against
-generated prices, then reports engine health and rule compliance. It exists to catch
-crashes, leaks, state loss across restarts and rail violations — **not** to say anything
-about performance. The prices are fake and its P&L is meaningless; it is a robustness test,
-not a backtest.
+Runs the equivalent of a month of continuous operation in a few seconds against generated
+prices, restarting the engine from disk along the way, then reports engine health and rule
+compliance: one decision per coin per day, trades only in the direction the close said,
+purchases only just after a close and never above a quarter of the account, and the books
+matching the cash to the cent. It is a robustness test, **not** a backtest — the prices are
+fake and its P&L is meaningless.
 
 Synthetic prices are a pure function of time, so an unpinned run walks a different price
 path every time. That is useful — each run explores a market shape the last one did not —
@@ -141,23 +132,25 @@ path; a nightly job runs unpinned to keep exploring new ones.
 ### Backtesting
 
 ```bash
-python tools/backtest.py --days 180
+python tools/backtest.py                              # the four coins, all their history
+python tools/backtest.py --start 2026-04-30           # from a date
+python tools/backtest.py --symbols BTCUSDT,ETHUSDT    # an experiment: further back, other coins
 ```
 
-Replays real Binance history through the real engine on a simulated clock — the same
-scanner, rails, sizing, exit ladder, fees and slippage — and reports trades, win rate,
-expectancy in R, drawdown, and buy-and-hold for comparison. Where the soak asks whether the
-engine survives, this asks whether the rules make money.
+Replays real daily Binance history through the real engine on a simulated clock — the same
+rule, sizing, sales-before-purchases, halt, books, fees and slippage — one decision a minute
+after each midnight, filled at that day's opening price. It reports the result, the worst
+drop, how much of the time it was invested, trades and fees, and buy-and-hold alongside,
+year by year. The market only ever shows days that had closed, so nothing from the future
+can reach a decision.
 
-Two things are substituted. The market serves recorded candles, and only bars that had
-closed by the simulated time, so nothing from the future can reach a decision. The decision
-layer approves everything the rails allow, at full size: the result is the rules with no
-judgement on top, and the live system takes a subset of those trades.
+On the doctrine's four coins from December 2021, when SOL had enough history, to October
+2026 it made **+158% with a 43% worst drop**, against +17% and 74% for holding — the same as
+the research script the doctrine was written from, which is the point of running it.
+`--set NAME=VALUE` and `--symbols` run experiments, and the report labels them as such.
 
 The first run needs a network connection and caches what it downloads in `data/backtest/`;
-later runs over the same window are offline. One window is one sample. Tune a rule on one
-period and check it on another, or the backtest will only tell you how well the rules
-memorised the past.
+later runs are offline. One window is one sample.
 
 ---
 
@@ -165,16 +158,16 @@ memorised the past.
 
 Five things, in this order.
 
-**1. Fund the account and get keys.** On Binance, create an API key with **spot trading
+**1. Get keys.** On Binance, create an API key with **spot trading
 enabled and withdrawals disabled**, restricted to your server's IP. The engine has no code
 path that can withdraw, but a key that *cannot* withdraw stays safe even if the whole box
 is compromised.
 
-**2. Match the quote currency to how the account is funded.** `HELM_QUOTE=EUR` trades
-`BTCEUR` and friends. If you funded with USDT, set `HELM_QUOTE=USDT`. Getting this wrong
-means the scanner finds no tradeable pairs — `doctor` will tell you.
+**2. Fund it in euros.** The doctrine trades the four coins against EUR. `doctor` checks
+that the venue prices all four.
 
-**3. Add the decision layer.** Set `ANTHROPIC_API_KEY`. Without it nothing is ever bought.
+**3. Use a fresh database.** A version-1 database is refused at startup — its positions
+carried stops and targets this version does not have. Point `HELM_DB` at a new file.
 
 **4. Guard the control API.** Set `HELM_UI_TOKEN` to a long random string:
 
@@ -183,7 +176,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 The guard fails open. With no token set, `POST /api/control/flatten` sells everything and
-`/api/control/pause` stops the engine, for anyone who can reach the port — no credential
+`/api/control/pause` stops purchases, for anyone who can reach the port — no credential
 required. That is a deliberate convenience when it is bound to a laptop, and an open
 liquidate button the moment the service has a domain, which on Railway it does by default.
 
@@ -202,14 +195,14 @@ by accident, a stale default, or a typo, and it cannot begin with the controls w
 
 Three ways, in descending order of how much has to be working:
 
-- **Flatten all** in the dashboard — sells everything at market, immediately.
+- **Flatten all** in the dashboard — sells everything at market, immediately, and pauses
+  purchases so the rule does not buy straight back in at the next close.
 - `POST /api/control/flatten` — the same thing without a browser.
 - `touch data/KILL` — the engine flattens and stops on its next cycle. No API, no UI, no
   network. This is the one that works when nothing else does.
 
-**Pause** is different from all three: it stops new entries while continuing to manage open
-positions. That is almost always what you want, because an abandoned position is worse than
-a managed one.
+**Pause** is different from all three: it stops purchases while sales carry on. A coin held
+against a broken trend is exactly what the rule exists to prevent.
 
 ---
 
@@ -217,18 +210,18 @@ a managed one.
 
 Four tabs.
 
-**Live** — equity and return, the risk meters (portfolio heat, drawdown, entries used
-today), a running plain-language narration of what the engine is doing, open positions drawn
-to scale between their stop and target, the equity curve, and every market it scanned
-including the ones it passed over.
+**Live** — equity and return; how much is invested, the drawdown against the 70% halt and
+the time to the next decision; the four coins, each against its 200-day average at the last
+close and now; the coins held, drawn to scale against the average they must stay above; a
+running plain-language narration; and the equity curve.
 
-**Trades** — closed trades only, with win rate, expectancy in R, and profit factor. Open
-positions are deliberately excluded: counting unrealised gains as performance is the most
-common way a trading record flatters itself.
+**Trades** — closed trades only, with how many won, the average return, fees and days held.
+Open positions are deliberately excluded: counting unrealised gains as performance is the
+most common way a trading record flatters itself, and with a trend rule most of the gain
+sits in a few positions that are open for months.
 
-**Decisions** — every setup that reached the desk, taken or not, with the thesis, what would
-invalidate it, and the factor scores behind it. Most entries here are refusals. That is the
-more informative half of the record and the reason the log exists.
+**Decisions** — every coin at every daily close: the close, the average, the distance
+between them and what the rule did about it, including the days it did nothing.
 
 **Doctrine** — the rulebook, rendered from `DOCTRINE.md`.
 
@@ -244,36 +237,30 @@ main.py                  entry point; also `python main.py doctor`
 DOCTRINE.md              the rules, in prose — the specification
 helm/
   doctrine.py            the rules, as constants. Single source of truth.
+  strategy.py            the rule: closes in, verdicts and purchase sizes out. Pure functions.
+  engine.py              the cycle: reconcile → record → (once a day) sell → buy → report
+  risk.py                account state and the reasons purchases may be blocked
+  positions.py           what each sale books: fees, lot steps, dust. Pure functions.
   config.py              operational settings from the environment
-  engine.py              the cycle: reconcile → manage → scan → decide → execute
-  risk.py                position sizing and the hard limits. Has veto power over everything.
-  positions.py           the exit ladder. Pure functions, heavily tested.
   store.py               SQLite persistence
   bus.py                 engine thread → browser event bridge
   api.py                 REST + WebSocket + static UI
   doctor.py              preflight checks
-  analysis/
-    indicators.py        EMA, RSI, ATR, ADX, Bollinger, Donchian — pure numpy
-    regime.py            4h regime classification (the veto)
-    setups.py            the three setups and their scoring
-    scanner.py           universe selection and ranking
-  brain/
-    claude.py            the decision layer; fails closed
-    prompts.py           the system prompt and the market brief
+  notify/telegram.py     alerts, the daily message, and remote control
   venues/
     binance.py           spot crypto: market data and signed execution
-    alpaca.py            US equities, fractional
     simulated.py         dry-run broker + synthetic market
 ui/                      dashboard: one HTML file, one CSS file, one JS file, no build step
-tests/                   167 tests
+tools/                   soak.py (robustness) and backtest.py (the rule on real history)
+tests/                   117 tests
 ```
 
 Two structural choices worth knowing about.
 
-**Rules are code, not configuration.** Nothing in `.env` can change a risk limit. Amending
-the doctrine means editing `helm/doctrine.py`, which means a diff and a commit. The point of
-writing rules down is that they stop being negotiable at exactly the moment they become
-inconvenient.
+**Rules are code, not configuration.** Nothing in `.env` can change the coins, the average,
+the sizing or the halt. Amending the doctrine means editing `helm/doctrine.py`, which means a
+diff and a commit. The point of writing rules down is that they stop being negotiable at
+exactly the moment they become inconvenient.
 
 **The exchange is the source of truth.** Every cycle reconciles open positions against the
 broker's actual balances. If they disagree, the engine is wrong and updates itself. A
@@ -288,10 +275,10 @@ than traded against.
 python -m pytest tests/ -q
 ```
 
-167 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
-exit ladder, and end-to-end trade lifecycles through the real engine against a simulated
-broker. The risk and exit tests are the ones that matter — they fail loudly if a limit is
-ever loosened.
+117 tests covering the rule's arithmetic, the engine's daily decision against closes
+set on purpose — what it buys, what it sells, when it waits, what pause and the halt block
+and what they never block — the books through lot steps and dust, restarts, the Telegram
+command surface, and the backtest's guarantee that no future price reaches a decision.
 
 These run in CI on every push and pull request, alongside a 30-day soak. Both must be green
 before anything merges — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
@@ -310,38 +297,36 @@ TELEGRAM_BOT_TOKEN=...     # from @BotFather
 TELEGRAM_CHAT_ID=...       # your numeric id, from @userinfobot
 ```
 
-**What it sends.** Entries, exits, halts, circuit breakers, order rejections, and one daily
-summary. It does *not* forward routine narration — the engine produces a line or two every
-cycle, and pushing those would train you to ignore the channel inside a day. Only
-entry/win/loss/warning/error levels reach your phone.
+**What it sends.** Every purchase and sale, halts, failed orders, and one message a day just
+after the close: each coin against its average, what was done, and the account. It does
+*not* forward routine narration; only purchase/sale/warning/error levels reach your phone.
 
-The daily summary arrives even when nothing happened, and that is deliberate: at this
-account size most days are correctly uneventful, and a system that only speaks when it
-trades is indistinguishable from one that has quietly died.
+The daily message arrives even when nothing happened, and that is deliberate: with this rule
+most days are correctly uneventful, and a system that only speaks when it trades is
+indistinguishable from one that has quietly died.
 
-**What you can send back.**
+**What you can send back.** The menu Telegram shows is registered by the engine at start,
+so it always matches what it answers.
 
 | Command | |
 |---|---|
-| `/status` | equity, risk, entries used, what it is doing |
-| `/positions` | open trades with entry, stop, target, R |
-| `/today` | trades closed today |
-| `/pause` · `/resume` | stop new entries, keep managing what is open |
-| `/flatten` | sell everything at market — asks for `/confirm` |
+| `/status` | equity, invested, drawdown, the four coins against their averages |
+| `/positions` | coins held, with their results so far and the average they must stay above |
+| `/trades` | the last closed trades |
+| `/pause` · `/resume` | stop purchases; sales carry on |
+| `/flatten` | sell everything at market and pause — asks for `/confirm` |
 | `/kill` | flatten and stop the engine — asks for `/confirm` |
 
 Two design choices worth stating.
 
-There is **no `/confirm_entry`**. The old build had Telegram approve each live trade; this
-one is autonomous by design, and a human gate on every entry would just be the old system
-with extra steps. The bot can stop this system — it cannot aim it.
+There is **no command to buy**. The bot can stop this system — it cannot aim it.
 
-`/flatten` and `/kill` **require a second message** within two minutes. They spend real
-money, and a fat-thumbed tap on a phone should not be able to close three positions.
+`/flatten` and `/kill` **require a second message** within two minutes. They sell real
+coins, and a fat-thumbed tap on a phone should not be able to empty the account.
 
 Commands are locked to one Telegram user id. A leaked token is not great, but its worst
 case is an unwanted flatten — lost opportunity, not lost capital, since nothing in the bot
-can open a position, raise a limit, or withdraw. Set `TELEGRAM_COMMANDS=false` for alerts
+can buy, raise a limit, or withdraw. Set `TELEGRAM_COMMANDS=false` for alerts
 only.
 
 ---
@@ -362,18 +347,18 @@ Create a volume in the Railway service settings, mount it at `/data`, and set:
 HELM_DB=/data/helm.db
 ```
 
-Railway's container filesystem is wiped on every deploy. This database holds the stop,
-target and thesis for every open position — the exchange holds the coins, but nothing else
-knows what they are for. Without a volume, a redeploy while a trade is open leaves real
-money sitting on the exchange with **no stop and nothing managing it**, which is the most
-dangerous state this system has.
+Railway's container filesystem is wiped on every deploy. This database is the only record of
+which coins the rule bought — the exchange holds the coins, but nothing else knows they are
+the rule's to sell. Without a volume, a redeploy while holding leaves real money on the
+exchange with **nothing managing it**: the rule will not sell what it has no record of, and
+will not buy more of it either.
 
-The engine detects the aftermath and alerts loudly — on startup it compares the exchange's
-balances against its own records and reports anything it has no plan for — but detection is
-a backstop, not a fix. `python main.py doctor` warns if `HELM_DB` looks container-local.
+The engine detects the aftermath and alerts loudly — every cycle it compares the exchange's
+balances against its own records and reports anything it has no record of — but detection
+is a backstop, not a fix. `python main.py doctor` warns if `HELM_DB` looks container-local.
 
 **One instance.** Two engines on one account will fight: both see the same balance, both
-size against it, both manage the same positions. Never scale this past one replica.
+size against it, both sell the same coins. Never scale this past one replica.
 
 **Set `HELM_UI_TOKEN`.** Railway gives the service a public `*.up.railway.app` domain, and
 the control API fails open: with no token, anyone who has the URL can `POST
@@ -382,11 +367,17 @@ it for the dry run too — the dry run is what you will leave running and forget
 
 `/health` stays unauthenticated on purpose, so Railway's healthcheck keeps working.
 
-### Migrating from the previous deployment
+### Upgrading from version 1
 
-The engine is a different program, so most of the old configuration no longer exists.
+Give version 2 a **new database file** (`HELM_DB`); it refuses a version-1 one. These
+settings no longer exist and can be deleted: `ANTHROPIC_API_KEY`, `HELM_MODEL`,
+`HELM_MODEL_EFFORT`, `HELM_SYMBOLS`, `HELM_QUOTE` and `HELM_SCAN_EVERY`. The coins and the
+quote currency are doctrine now, and there is no model to call.
 
-**Delete all of these** — they are gone, not renamed:
+### Migrating from the original deployment
+
+The pre-Helm build ran on Bybit with Supabase and Vercel. **Delete all of these** — they are
+gone, not renamed:
 
 ```
 BYBIT_*              SUPABASE_*           PAPER_*              LIVE_*
@@ -396,29 +387,15 @@ RISK_REWARD_RATIO    STOP_ATR_MULTIPLIER  TRAIL_ATR_MULTIPLIER PARTIAL_PROFIT_RR
 SIGNAL_CONFIDENCE_THRESHOLD              MAX_VOLATILITY_PCT    MIN_ORDER_NOTIONAL
 SWING_LOOKBACK       BREAKOUT_LOOKBACK    VOLUME_CONFIRMATION_RATIO
 SYMBOL_TOP_N         SYMBOL_MIN_STRENGTH_SCORE                 POLL_INTERVAL_SECONDS
+TRADED_SYMBOLS       ANTHROPIC_*
 ```
 
-That list is the migration in miniature. Every risk and strategy parameter it contains now
-lives in `helm/doctrine.py` as a constant, unreachable from the environment. It was
-possible to widen a stop or raise the risk per trade by editing a variable in a hosting
-dashboard; now it takes a commit. A rule you can change at 2am from your phone, while
-losing, is not a rule.
-
-**Keep and rename:**
-
-| Old | New | Note |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | `TELEGRAM_BOT_TOKEN` | same bot, new commands |
-| `TELEGRAM_CHAT_ID` | `TELEGRAM_CHAT_ID` | unchanged |
-| `TELEGRAM_ALLOWED_USER_ID` | `TELEGRAM_ALLOWED_USER_ID` | now defaults to the chat id |
-| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` | unchanged |
-| `ANTHROPIC_MODEL` | `HELM_MODEL` | |
-| `TRADED_SYMBOLS` | `HELM_SYMBOLS` | optional; empty means rank by liquidity |
-| `LOG_LEVEL` | `LOG_LEVEL` | unchanged |
-
-**Add:** `HELM_MODE`, `HELM_VENUE`, `HELM_QUOTE`, `HELM_STARTING_EQUITY`, `HELM_DB`,
-`HELM_UI_TOKEN`, `BINANCE_API_KEY`, `BINANCE_API_SECRET`, and — only when you actually mean
-it — `I_UNDERSTAND_REAL_MONEY`.
+Every strategy parameter that list contains is now a constant in `helm/doctrine.py`,
+unreachable from the environment. A rule you can change at 2am from your phone, while
+losing, is not a rule. Keep `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,
+`TELEGRAM_ALLOWED_USER_ID` (now defaulting to the chat id) and `LOG_LEVEL`. Add `HELM_MODE`,
+`HELM_VENUE`, `HELM_STARTING_EQUITY`, `HELM_DB`, `HELM_UI_TOKEN`, `BINANCE_API_KEY`,
+`BINANCE_API_SECRET`, and — only when you actually mean it — `I_UNDERSTAND_REAL_MONEY`.
 
 The old Supabase project can be deleted once you no longer want the history. Nothing reads
 it; the engine owns its own SQLite database now.

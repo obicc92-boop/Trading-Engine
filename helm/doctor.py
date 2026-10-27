@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import doctrine
+from . import doctrine, strategy
+
 
 class _Skip(Exception):
     """Control flow for the synthetic venue, which has no network checks to run."""
@@ -52,25 +53,20 @@ def run(config) -> int:
         # not a degraded one, and it must never be mistaken for a live configuration.
         # Storage and notification checks still run below: they matter either way.
         print(f"{WARN} venue is 'synthetic' — prices are generated, nothing here is a real market")
-        print("      set HELM_VENUE=binance (or alpaca) to trade an actual venue")
+        print("      set HELM_VENUE=binance to trade an actual venue")
         warnings += 1
 
     try:
         if synthetic:
             raise _Skip()
-        if config.venue == "alpaca":
-            from .venues.alpaca import AlpacaVenue
+        from .venues.binance import BinanceVenue
 
-            market = AlpacaVenue(config)
-        else:
-            from .venues.binance import BinanceVenue
-
-            market = BinanceVenue(config)
-            market.sync_time()
+        market = BinanceVenue(config)
+        market.sync_time()
         instruments = market.instruments()
         print(f"{TICK} {config.venue} reachable — {len(instruments)} {config.quote} pairs tradeable")
         if not instruments:
-            print(f"{CROSS} no {config.quote} pairs found — is HELM_QUOTE right for this venue?")
+            print(f"{CROSS} no {config.quote} pairs found — this venue cannot trade the doctrine's coins")
             problems += 1
     except _Skip:
         pass
@@ -83,24 +79,31 @@ def run(config) -> int:
     if market is not None:
         try:
             quotes = market.quotes()
-            liquid = sum(1 for q in quotes.values() if q.quote_volume_24h >= doctrine.MIN_QUOTE_VOLUME_24H)
-            print(f"{TICK} market data: {len(quotes)} quotes, {liquid} pass the liquidity floor")
-            if liquid == 0:
-                print(f"{WARN} nothing meets the {doctrine.MIN_QUOTE_VOLUME_24H:,.0f} 24h volume minimum")
-                warnings += 1
+            priced = [symbol for symbol in doctrine.SYMBOLS if symbol in quotes]
+            print(f"{TICK} market data: {len(priced)} of the {len(doctrine.SYMBOLS)} doctrine pairs priced")
+            if len(priced) < len(doctrine.SYMBOLS):
+                absent = ", ".join(sorted(set(doctrine.SYMBOLS) - set(priced)))
+                print(f"{CROSS} no price for {absent} — the rule cannot trade what it cannot see")
+                problems += 1
         except Exception as exc:
             print(f"{CROSS} quotes failed: {exc}")
             problems += 1
 
-        for timeframe in (doctrine.REGIME_TF, doctrine.STRUCTURE_TF, doctrine.TRIGGER_TF):
+        # The rule reads one closed daily candle per coin, against the 200 before it.
+        for symbol in doctrine.SYMBOLS:
             try:
-                probe = next(iter(market.instruments()))
-                candles = market.candles(probe, timeframe, 60)
-                print(f"{TICK} candles {timeframe}: {len(candles)} bars for {probe}")
+                candles = market.candles(symbol, doctrine.TREND_TF, doctrine.SMA_DAYS + 5)
+                signal = strategy.read(candles)
+                if signal is None:
+                    print(f"{CROSS} {symbol}: only {len(candles)} closed days, the average needs "
+                          f"{doctrine.SMA_DAYS}")
+                    problems += 1
+                    continue
+                print(f"{TICK} {symbol}: closed {signal.distance*100:+.1f}% "
+                      f"{'above' if signal.on else 'below'} its {doctrine.SMA_DAYS}-day average")
             except Exception as exc:
-                print(f"{CROSS} candles {timeframe} failed: {exc}")
+                print(f"{CROSS} {symbol} daily candles failed: {exc}")
                 problems += 1
-                break
 
     # -- credentials ---------------------------------------------------------------------
     if synthetic:
@@ -110,59 +113,19 @@ def run(config) -> int:
             balances = market.balances()
             cash = balances.get(config.quote, 0.0)
             print(f"{TICK} account reachable — {cash:.2f} {config.quote} free")
-            if cash < doctrine.MIN_NOTIONAL * 2:
-                print(f"{WARN} {cash:.2f} {config.quote} is below what two minimum positions need")
+            floor = doctrine.MIN_NOTIONAL / doctrine.ENTRY_FRACTION
+            if cash < floor:
+                print(f"{WARN} with under {floor:.0f} {config.quote} in the account, a quarter of it is "
+                      f"below the minimum order and the rule cannot buy — fine if the rest is "
+                      f"already invested")
                 warnings += 1
         except Exception as exc:
             print(f"{CROSS} account check failed: {exc}")
             problems += 1
     else:
-        keys = "present" if (config.binance_key or config.alpaca_key) else "absent"
+        keys = "present" if config.binance_key else "absent"
         print(f"{WARN} not live — exchange credentials {keys}, no order path tested")
         warnings += 1
-
-    # -- decision layer ------------------------------------------------------------------
-    if config.brain_enabled:
-        try:
-            import anthropic
-
-            client = anthropic.Anthropic(api_key=config.anthropic_key, timeout=30.0)
-            client.messages.create(
-                model=config.model,
-                max_tokens=16,
-                messages=[{"role": "user", "content": "Reply with the single word: ready"}],
-            )
-            print(f"{TICK} decision layer: {config.model} responding")
-        except Exception as exc:
-            print(f"{CROSS} decision layer unreachable: {exc}")
-            print("      without it every candidate is declined and nothing will be bought")
-            problems += 1
-        else:
-            # A reachable model is not a working desk. The real decision request carries the
-            # system prompt and a structured-output schema, and the API can reject it outright
-            # while the ping above succeeds: it did, and every candidate was a silent NO-GO.
-            # count_tokens validates the full request without generating anything, so it is free.
-            try:
-                from .brain import prompts
-
-                client.messages.count_tokens(
-                    model=config.model,
-                    system=prompts.SYSTEM,
-                    thinking={"type": "adaptive"},
-                    output_config={
-                        "effort": config.model_effort,
-                        "format": {"type": "json_schema", "schema": prompts.ENTRY_SCHEMA},
-                    },
-                    messages=[{"role": "user", "content": "validation only"}],
-                )
-                print(f"{TICK} decision request accepted (prompt, schema, effort {config.model_effort})")
-            except Exception as exc:
-                print(f"{CROSS} decision request rejected: {exc}")
-                print("      every candidate would be declined: a failed decision call is a NO-GO")
-                problems += 1
-    else:
-        print(f"{CROSS} no ANTHROPIC_API_KEY — every candidate will be declined")
-        problems += 1
 
     # -- storage -------------------------------------------------------------------------
     try:
