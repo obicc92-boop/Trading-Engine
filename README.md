@@ -37,8 +37,11 @@ What is genuinely true about it:
 
 What is **not** true about it:
 
-- It has not been backtested. There is no historical performance to show you, and the
-  synthetic market in this repo is a rendering aid, not a simulation of anything.
+- It has no record of making money. A backtest of the rules alone — no decision layer —
+  over April to October 2026 on BTC, ETH, SOL and XRP lost 10.2% while simply holding the
+  same four coins made 11%. Before fees its 140 trades came out about even (−€0.53); the
+  €9.63 paid in fees is nearly all of the loss. See [Backtesting](#backtesting).
+  The synthetic market in this repo is a rendering aid, not a simulation of anything.
 - Stops are not guarantees. In a fast market a stop becomes a market order and fills where
   it fills.
 - If the process dies or the exchange goes down, open positions are unmanaged until it
@@ -134,6 +137,27 @@ python tools/soak.py --days 30 --start-at 1757000000000
 
 CI pins that value so a red build always means a real regression rather than an unlucky
 path; a nightly job runs unpinned to keep exploring new ones.
+
+### Backtesting
+
+```bash
+python tools/backtest.py --days 180
+```
+
+Replays real Binance history through the real engine on a simulated clock — the same
+scanner, rails, sizing, exit ladder, fees and slippage — and reports trades, win rate,
+expectancy in R, drawdown, and buy-and-hold for comparison. Where the soak asks whether the
+engine survives, this asks whether the rules make money.
+
+Two things are substituted. The market serves recorded candles, and only bars that had
+closed by the simulated time, so nothing from the future can reach a decision. The decision
+layer approves everything the rails allow, at full size: the result is the rules with no
+judgement on top, and the live system takes a subset of those trades.
+
+The first run needs a network connection and caches what it downloads in `data/backtest/`;
+later runs over the same window are offline. One window is one sample. Tune a rule on one
+period and check it on another, or the backtest will only tell you how well the rules
+memorised the past.
 
 ---
 
@@ -241,7 +265,7 @@ helm/
     alpaca.py            US equities, fractional
     simulated.py         dry-run broker + synthetic market
 ui/                      dashboard: one HTML file, one CSS file, one JS file, no build step
-tests/                   97 tests
+tests/                   167 tests
 ```
 
 Two structural choices worth knowing about.
@@ -264,7 +288,7 @@ than traded against.
 python -m pytest tests/ -q
 ```
 
-138 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
+167 tests covering indicator correctness, the sizing arithmetic, every risk rail, the full
 exit ladder, and end-to-end trade lifecycles through the real engine against a simulated
 broker. The risk and exit tests are the ones that matter — they fail loudly if a limit is
 ever loosened.

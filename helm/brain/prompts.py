@@ -69,12 +69,15 @@ about to be at risk. No jargon for its own sake, no hedging, and no restating th
 back — say what you think is happening and why it is worth 1.5% of the account to find out."""
 
 
+# Structured outputs reject `minimum`/`maximum` on numeric fields with a 400, and a failed
+# call is a NO-GO: with them in, every candidate was refused before the model saw it. The
+# bounds are stated in the descriptions and enforced in code (Brain.judge_entry clamps).
 ENTRY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "go": {"type": "boolean"},
-        "conviction": {"type": "integer", "minimum": 0, "maximum": 100},
-        "size_multiplier": {"type": "number", "minimum": 0.25, "maximum": 1.0},
+        "conviction": {"type": "integer", "description": "0 to 100"},
+        "size_multiplier": {"type": "number", "description": "0.25 to 1.0"},
         "tighten_stop_to": {"type": ["number", "null"]},
         "thesis": {"type": "string"},
         "invalidation": {"type": "string"},
@@ -89,7 +92,7 @@ EXIT_SCHEMA: dict[str, Any] = {
     "properties": {
         "action": {"type": "string", "enum": ["HOLD", "EXIT"]},
         "reason": {"type": "string"},
-        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "confidence": {"type": "integer", "description": "0 to 100"},
     },
     "required": ["action", "reason", "confidence"],
     "additionalProperties": False,

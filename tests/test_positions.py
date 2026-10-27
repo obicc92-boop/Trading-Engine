@@ -8,7 +8,7 @@ import pytest
 
 from helm import doctrine
 from helm.models import Analysis, Position
-from helm.positions import plan, realise, update_highest_close
+from helm.positions import book_swept, plan, realise, update_highest_close, write_off
 
 HOUR = 3_600_000
 
@@ -199,6 +199,36 @@ def test_a_winning_round_trip_nets_positive():
     realise(position, 0.5, 104.0, 0.02)
     realise(position, 0.5, 112.0, 0.02)
     assert position.realized_pnl > 0
+
+
+def test_write_off_makes_the_booked_result_equal_the_cash():
+    """A final exit floored to the lot step leaves a sliver unsold. The books must charge
+    for it, or the realised result drifts above the cash by its cost on every trade."""
+    position = make(entry_fee=0.10)
+    paid = 100.0 * 1.0 + 0.10                         # what the buy took out of the account
+    realise(position, 0.99, 110.0, 0.11)              # only 0.99 could be sold
+    write_off(position)
+
+    received = 0.99 * 110.0 - 0.11
+    assert position.realized_pnl == pytest.approx(received - paid)
+    assert position.qty == 0.0
+
+
+def test_write_off_does_nothing_when_everything_sold():
+    position = make(entry_fee=0.10)
+    realise(position, 1.0, 110.0, 0.11)
+    before = position.realized_pnl
+    assert write_off(position) == 0.0
+    assert position.realized_pnl == before
+
+
+def test_swept_dust_is_booked_as_pure_proceeds():
+    """Its cost was written off by the trade that left it, so all it fetches is result."""
+    position = make()
+    net = book_swept(position, 0.01, 110.0, 0.001)
+    assert net == pytest.approx(1.1 - 0.001)
+    assert position.realized_pnl == pytest.approx(net)
+    assert position.qty == 1.0                        # the position's own coins are untouched
 
 
 # -- regime-break counting is per bar, not per cycle --------------------------------------

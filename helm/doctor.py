@@ -137,6 +137,29 @@ def run(config) -> int:
             print(f"{CROSS} decision layer unreachable: {exc}")
             print("      without it every candidate is declined and nothing will be bought")
             problems += 1
+        else:
+            # A reachable model is not a working desk. The real decision request carries the
+            # system prompt and a structured-output schema, and the API can reject it outright
+            # while the ping above succeeds: it did, and every candidate was a silent NO-GO.
+            # count_tokens validates the full request without generating anything, so it is free.
+            try:
+                from .brain import prompts
+
+                client.messages.count_tokens(
+                    model=config.model,
+                    system=prompts.SYSTEM,
+                    thinking={"type": "adaptive"},
+                    output_config={
+                        "effort": config.model_effort,
+                        "format": {"type": "json_schema", "schema": prompts.ENTRY_SCHEMA},
+                    },
+                    messages=[{"role": "user", "content": "validation only"}],
+                )
+                print(f"{TICK} decision request accepted (prompt, schema, effort {config.model_effort})")
+            except Exception as exc:
+                print(f"{CROSS} decision request rejected: {exc}")
+                print("      every candidate would be declined: a failed decision call is a NO-GO")
+                problems += 1
     else:
         print(f"{CROSS} no ANTHROPIC_API_KEY — every candidate will be declined")
         problems += 1

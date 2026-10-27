@@ -129,8 +129,9 @@ def bollinger(close: np.ndarray, period: int = 20, mult: float = 2.0):
     """Returns (upper, middle, lower, bandwidth) — bandwidth as a fraction of the middle."""
     middle = sma(close, period)
     std = np.full(close.size, np.nan)
-    for i in range(period - 1, close.size):
-        std[i] = close[i - period + 1 : i + 1].std()
+    if close.size >= period:
+        # One vectorised pass over every window; a per-window loop dominated backtest time.
+        std[period - 1 :] = np.lib.stride_tricks.sliding_window_view(close, period).std(axis=1)
     upper = middle + mult * std
     lower = middle - mult * std
     with np.errstate(divide="ignore", invalid="ignore"):
