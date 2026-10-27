@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import soak  # noqa: E402  — the simulated clock and database handling are shared
 from helm import doctrine  # noqa: E402
+from helm.analysis import setups  # noqa: E402
 from helm.config import Config  # noqa: E402
 from helm.models import Candles, Instrument, Quote, Verdict  # noqa: E402
 from helm.venues.base import VenueError  # noqa: E402
@@ -48,6 +49,13 @@ from helm.venues.base import VenueError  # noqa: E402
 BINANCE = "https://api.binance.com"
 MINUTE = 60_000
 TF_MS = {"1m": MINUTE, "15m": 15 * MINUTE, "1h": 60 * MINUTE, "4h": 240 * MINUTE}
+
+# The doctrine's setups, by the name trades are recorded under, and their detectors.
+SETUPS = {
+    "TREND_PULLBACK": "_trend_pullback",
+    "SQUEEZE_BREAKOUT": "_squeeze_breakout",
+    "CAPITULATION_REVERSAL": "_capitulation_reversal",
+}
 
 # Closed bars of history needed before the first simulated minute. The engine asks for at
 # most 250 on any timeframe; the margin keeps the first scan from running short.
@@ -218,6 +226,11 @@ def main() -> int:
                         help="experiment: replace a numeric doctrine constant for this run "
                              "only, e.g. --set TIME_STOP_HOURS=48. Repeatable. Exists only "
                              "here — the engine itself has no way to change a rule")
+    parser.add_argument("--without", action="append", default=[], choices=sorted(SETUPS),
+                        help="experiment: switch one of the doctrine's setups off for this run")
+    parser.add_argument("--fee", type=float, default=None,
+                        help="taker fee as a fraction, e.g. 0.00075 for Binance with fees paid "
+                             "in BNB. Defaults to HELM_TAKER_FEE (0.001)")
     args = parser.parse_args()
 
     overrides = []
@@ -228,6 +241,10 @@ def main() -> int:
             raise SystemExit(f"--set {item}: doctrine has no numeric constant called {name}")
         setattr(doctrine, name, type(current)(float(value)))
         overrides.append(f"{name} {current} -> {getattr(doctrine, name)}")
+    for name in args.without:
+        # detect() looks each detector up by name on every call, so this takes effect.
+        setattr(setups, SETUPS[name], lambda *args, **kwargs: None)
+        overrides.append(f"{name} switched off")
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     if args.end:
@@ -253,6 +270,8 @@ def main() -> int:
     config.quote = args.quote
     config.symbols = symbols
     config.starting_equity = args.equity
+    if args.fee is not None:
+        config.taker_fee = args.fee
     config.scan_every_cycles = 1      # scan cadence is set by the loop below instead
     config.anthropic_key = ""         # the desk below decides; nothing may reach the real API
     config.telegram_token = ""        # and a backtest must never page anyone
@@ -323,7 +342,7 @@ def main() -> int:
     print(f"           {_date(start)} to {_date(end)} ({args.days} days)")
     print("=" * 64)
     print("  rules only — no decision layer. Fills at the 1m close, "
-          f"{engine.broker.slippage * 1e4:.0f}bps slippage, {config.taker_fee * 100:.2f}% fee.")
+          f"{engine.broker.slippage * 1e4:.0f}bps slippage, {config.taker_fee * 100:.3f}% fee.")
     for change in overrides:
         print(f"  EXPERIMENT — not the doctrine: {change}")
 
