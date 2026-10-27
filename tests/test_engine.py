@@ -1,66 +1,36 @@
 """End-to-end engine behaviour.
 
-The real `Engine`, the real risk rails, the real exit ladder, the real store — driven
-against the synthetic market with a stubbed decision layer, because the point is to test
-the wiring rather than the model. Anything mocked here is called out.
+The real `Engine`, the real store and the real simulated broker, driven against a market
+whose daily closes each test sets on purpose (`tests/support.py`) and a clock it moves.
+Nothing about the rule is mocked: what the engine buys and sells follows from the closes.
 """
+
+import json
 
 import pytest
 
 from helm import doctrine
-from helm.config import Config
-from helm.engine import Engine
-from helm.models import Analysis, Candidate, Verdict
+from helm.engine import GIVE_UP_MS, RETRY_MS
+from helm.models import Position
+from helm.store import Store
+from helm.venues.base import VenueError
+from tests.support import DOWN, UP, TrendMarket, build_engine
 
 
 @pytest.fixture
-def engine(tmp_path):
-    config = Config()
-    config.db_path = str(tmp_path / "test.db")
-    config.venue = "synthetic"
-    engine = Engine(config)
-    engine.refresh_prices()
-    return engine
+def engine(tmp_path, market):
+    return build_engine(str(tmp_path / "test.db"), market)
 
 
-def approve(engine, **kwargs):
-    """Stub the decision layer with a GO, so the wiring around it is what gets tested."""
-    verdict = Verdict(go=True, conviction=70, size_multiplier=1.0, stop_override=None,
-                      thesis="Stubbed approval.", invalidation="stub", source="stub", **kwargs)
-    engine.brain.judge_entry = lambda *args, **kw: verdict
-    return verdict
+def held(engine):
+    return sorted(position.symbol for position in engine.positions)
 
 
-def decline(engine):
-    verdict = Verdict(go=False, conviction=10, size_multiplier=0.25, stop_override=None,
-                      thesis="Stubbed refusal.", invalidation="stub", source="stub")
-    engine.brain.judge_entry = lambda *args, **kw: verdict
-    return verdict
-
-
-def make_candidate(engine, symbol="BTCEUR", score=75.0):
-    price = engine._prices[symbol]
-    analysis = Analysis(symbol=symbol, price=price, regime="TRENDING_UP",
-                        indicators={"atr": price * 0.01, "swing_low": price * 0.97,
-                                    "ema21": price * 0.99, "rsi": 55.0})
-    engine._analysis[symbol] = analysis
-    return Candidate(symbol=symbol, setup="TREND_PULLBACK", score=score, factors={},
-                     price=price, stop=price * 0.96, target=price * 1.12,
-                     regime="TRENDING_UP", analysis=analysis, rationale=["test"])
-
-
-def mark(engine, symbol, price):
-    engine._prices[symbol] = price
-    engine.broker.set_marks(engine._prices)
+def actions(engine):
+    return {row["symbol"]: row["action"] for row in engine.store.decisions(4)}
 
 
 # -- boot --------------------------------------------------------------------------------
-
-def test_cycle_runs_clean_with_no_positions(engine):
-    engine.cycle()
-    assert engine.snapshot()["cycle"] == 1
-    assert engine.snapshot()["positions"] == []
-
 
 def test_dry_mode_never_uses_a_live_broker(engine):
     assert engine.broker.live is False
@@ -68,437 +38,424 @@ def test_dry_mode_never_uses_a_live_broker(engine):
 
 
 def test_snapshot_is_json_safe(engine):
-    import json
-
     engine.cycle()
     json.dumps(engine.snapshot())      # raises on NaN or numpy scalars
 
 
-# -- entry -------------------------------------------------------------------------------
+def test_snapshot_shows_every_coin_against_its_average(engine, market):
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
+    coins = {row["symbol"]: row for row in engine.snapshot()["coins"]}
+    assert list(coins) == list(doctrine.SYMBOLS)
+    assert coins["BTCEUR"]["on"] is True and coins["BTCEUR"]["held"] is True
+    assert coins["ETHEUR"]["on"] is False and coins["ETHEUR"]["held"] is False
+    assert coins["BTCEUR"]["distance"] == pytest.approx(UP / coins["BTCEUR"]["average"] - 1)
 
-def test_a_declined_candidate_is_not_traded(engine):
-    decline(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
+
+def test_refuses_a_version_one_database(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "v1.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE positions (id TEXT, setup TEXT, stop REAL)")
+    with pytest.raises(RuntimeError, match="version 1"):
+        Store(str(path))
+
+
+# -- the daily decision ------------------------------------------------------------------
+
+def test_buys_a_quarter_of_the_account_in_each_coin_above_its_average(engine, market):
+    market.set_close("BTCEUR", UP)
+    market.set_close("SOLEUR", UP)
+    engine.cycle()
+
+    assert held(engine) == ["BTCEUR", "SOLEUR"]
+    for position in engine.positions:
+        assert position.cost == pytest.approx(25.0)
+    assert engine.account_state().cash == pytest.approx(50.0)
+    assert actions(engine) == {"BTCEUR": "BUY", "ETHEUR": "STAY_OUT", "SOLEUR": "BUY", "XRPEUR": "STAY_OUT"}
+
+
+def test_all_four_on_means_fully_invested(engine, market):
+    for symbol in doctrine.SYMBOLS:
+        market.set_close(symbol, UP)
+    engine.cycle()
+    assert held(engine) == sorted(doctrine.SYMBOLS)
+    assert engine.account_state().cash == pytest.approx(0.0, abs=0.01)
+
+
+def test_decides_once_a_day_however_often_it_cycles(engine, market, clock):
+    engine.cycle()
+    market.set_close("BTCEUR", UP)          # a change after the decision is not acted on
+    for _ in range(10):
+        clock.advance(60_000)
+        engine.cycle()
     assert engine.positions == []
-    assert engine.store.decisions()[0]["blocked_by"] == "declined"
+    assert len(engine.store.decisions(100)) == len(doctrine.SYMBOLS)
 
 
-def test_no_decision_layer_means_no_trade(engine):
-    """The default posture with no API key: candidates arrive, nothing is bought."""
-    assert engine.brain.enabled is False
-    engine._consider(make_candidate(engine), engine.account_state())
-    assert engine.positions == []
+def test_acts_on_the_next_close(engine, market):
+    engine.cycle()
+    market.new_day({"BTCEUR": UP})
+    engine.cycle()
+    assert held(engine) == ["BTCEUR"]
 
 
-def test_an_approved_candidate_opens_a_sized_position(engine):
-    approve(engine)
-    assert engine._consider(make_candidate(engine), engine.account_state())
-
-    position = engine.positions[0]
-    assert position.symbol == "BTCEUR"
-    assert position.qty > 0
-    # Risk is bounded by the doctrine, measured from the actual fill.
-    assert position.risk_amount <= doctrine.MAX_RISK_PER_TRADE * 100.0 + 0.05
-    assert position.notional == pytest.approx(37.5, rel=0.05)
-
-
-def test_the_position_is_persisted_and_survives_a_restart(engine, tmp_path):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-    original = engine.positions[0]
-
-    revived = Engine(engine.config)
-    revived._restore_positions()
-    assert len(revived.positions) == 1
-    assert revived.positions[0].id == original.id
-    assert revived.positions[0].stop == pytest.approx(original.stop)
-
-
-def test_decision_is_logged_with_its_thesis(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-    record = engine.store.decisions()[0]
-    assert record["go"] is True
-    assert record["thesis"] == "Stubbed approval."
-    assert record["position_id"] is not None
-
-
-# -- lifecycle ---------------------------------------------------------------------------
-
-def test_winning_trade_scales_out_then_trails_to_a_profit(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-    position = engine.positions[0]
-    r_unit = position.r_unit
-    starting_qty = position.qty
-
-    mark(engine, "BTCEUR", position.entry_price + r_unit * 1.05)
-    engine._manage_one(position)
-    assert position.scaled_out
-    assert position.qty == pytest.approx(starting_qty / 2, rel=0.02)
-    assert position.stop > position.entry_price        # the trade is now free
-    assert position.realized_pnl > 0
-
-    position.highest_close = position.entry_price + r_unit * 3
-    mark(engine, "BTCEUR", position.entry_price + r_unit * 2.8)
-    engine._manage_one(position)
-    assert position.stop > position.entry_price
-
-    mark(engine, "BTCEUR", position.stop * 0.999)
-    engine._manage_one(position)
+def test_sells_a_coin_when_it_closes_below_its_average(engine, market):
+    market.set_close("ETHEUR", UP)
+    engine.cycle()
+    market.new_day({"ETHEUR": DOWN})
+    engine.cycle()
 
     assert engine.positions == []
-    closed = engine.store.closed_positions()[0]
-    assert closed["realized_pnl"] > 0
-    assert closed["r_multiple"] > 0
+    trade = engine.store.closed_positions()[0]
+    assert trade["exit_reason"] == "TREND_OFF"
+    assert trade["realized_pnl"] < 0
+    assert actions(engine)["ETHEUR"] == "SELL"
 
 
-def test_losing_trade_costs_no_more_than_the_planned_risk(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-    position = engine.positions[0]
-    planned = position.risk_amount
-
-    mark(engine, "BTCEUR", position.stop * 0.999)
-    engine._manage_one(position)
-
-    closed = engine.store.closed_positions()[0]
-    assert closed["realized_pnl"] < 0
-    # Slippage and fees make the realised loss slightly worse than planned, but only
-    # slightly — anything beyond a small margin means sizing is broken.
-    assert abs(closed["realized_pnl"]) < planned * 1.25
+def test_holds_through_a_loss_while_the_trend_holds(engine, market):
+    """No stop inside the trend: a close that is lower, but still above the average, is held."""
+    market.set_close("ETHEUR", UP)
+    engine.cycle()
+    market.new_day({"ETHEUR": UP * 0.95})
+    engine.cycle()
+    assert held(engine) == ["ETHEUR"]
+    assert actions(engine)["ETHEUR"] == "HOLD"
 
 
-def test_a_stop_out_puts_the_symbol_on_cooldown(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-    position = engine.positions[0]
-    mark(engine, "BTCEUR", position.stop * 0.999)
-    engine._manage_one(position)
-
-    verdict = engine.risk.evaluate(
-        make_candidate(engine), engine.account_state(), engine.last_cycle_at or 1
-    )
-    assert not verdict.allowed
-
-
-def test_catastrophe_guard_closes_a_gapped_position(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-    position = engine.positions[0]
-
-    mark(engine, "BTCEUR", position.entry_price * 0.88)     # gapped straight through
-    engine._manage_one(position)
-
-    assert engine.positions == []
-    assert engine.store.closed_positions()[0]["exit_reason"] == "CATASTROPHE"
-
-
-# -- rails in the live path --------------------------------------------------------------
-
-def test_will_not_open_a_second_position_in_the_same_symbol(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-    assert not engine._consider(make_candidate(engine), engine.account_state())
+def test_never_adds_to_a_coin_already_held(engine, market):
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
+    market.new_day({"BTCEUR": UP * 1.2})
+    engine.cycle()
     assert len(engine.positions) == 1
+    assert engine.positions[0].cost == pytest.approx(25.0)
 
 
-def test_stops_entering_at_the_position_cap(engine):
-    approve(engine)
-    for symbol in ("BTCEUR", "ETHEUR", "SOLEUR", "ADAEUR"):
-        engine.brain._asked.clear()
-        engine._consider(make_candidate(engine, symbol), engine.account_state())
-    assert len(engine.positions) <= doctrine.MAX_OPEN_POSITIONS
+def test_sells_first_so_the_sale_pays_for_the_purchase(engine, market):
+    for symbol in doctrine.SYMBOLS[:3]:
+        market.set_close(symbol, UP)
+    market.set_close("XRPEUR", DOWN)
+    engine.cycle()
+    engine.broker._balances["EUR"] = 0.0     # spend the last quarter elsewhere
+
+    market.new_day({"BTCEUR": DOWN, "XRPEUR": UP})
+    engine.cycle()
+    assert held(engine) == ["ETHEUR", "SOLEUR", "XRPEUR"]
 
 
-def test_pausing_stops_new_entries_but_keeps_managing(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
+def test_records_every_coin_every_day_including_the_quiet_ones(engine, market):
+    engine.cycle()
+    market.new_day()
+    engine.cycle()
+    rows = engine.store.decisions(100)
+    assert len(rows) == 2 * len(doctrine.SYMBOLS)
+    assert all(row["close"] and row["average"] for row in rows)
+
+
+# -- when it will not buy ----------------------------------------------------------------
+
+def test_paused_it_still_sells_but_does_not_buy(engine, market):
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
     engine.pause()
-    engine.hunt()                       # must not raise, must not enter
-    assert len(engine.positions) == 1
-    assert "paused by hand" in engine.snapshot()["blocks"]
+    market.new_day({"BTCEUR": DOWN, "ETHEUR": UP})
+    engine.cycle()
 
-
-def test_flatten_closes_everything(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-    assert engine.flatten("test") == 1
     assert engine.positions == []
-    assert engine.store.closed_positions()[0]["exit_reason"] == "FLATTENED"
+    assert actions(engine)["BTCEUR"] == "SELL"
+    assert actions(engine)["ETHEUR"] == "STAY_OUT"
+    assert any("paused" in row["note"] for row in engine.store.decisions(4))
 
 
-def test_halt_blocks_entries_until_cleared(engine):
+def test_halts_at_seventy_percent_below_peak_and_keeps_selling(engine, market):
+    for symbol in doctrine.SYMBOLS:
+        market.set_close(symbol, UP)
+    engine.cycle()                                    # fully invested, peak 100
+
+    crash = {symbol: UP * 0.25 for symbol in doctrine.SYMBOLS}
+    crash["BTCEUR"] = UP * 0.3
+    market.closes = {s: [UP * 0.2] * 199 + [market.closes[s][-1]] for s in doctrine.SYMBOLS}
+    market.new_day(crash)                             # still above their (crashed) averages
+    engine.cycle()
+    assert engine.halted
+    assert "70%" in engine.halt_reason
+
+    market.new_day({"BTCEUR": UP * 0.01})             # BTC breaks its trend
+    engine.cycle()
+    assert "BTCEUR" not in held(engine), "a halt must never stop a sale"
+
+
+def test_a_halt_blocks_purchases_until_cleared(engine, market):
     engine.halt("testing")
-    assert engine.risk.gate_entries(engine.account_state(), 1)
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
+    assert engine.positions == []
+
     engine.clear_halt()
+    market.new_day()
+    engine.cycle()
+    assert held(engine) == ["BTCEUR"]
+
+
+def test_clearing_a_halt_measures_the_peak_afresh(engine, market):
+    """Otherwise the next decision sees the same drop against the same peak and halts again."""
+    engine.store.put("equity_peak", 1_000.0)
+    engine.cycle()
+    assert engine.halted
+
+    engine.clear_halt()
+    market.new_day()
+    engine.cycle()
     assert not engine.halted
+
+
+def test_will_not_buy_a_coin_the_account_already_holds_unrecorded(engine, market):
+    engine.broker._balances["BTC"] = 0.5            # ~50 EUR the engine has no record of
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
+    assert engine.positions == []
+    assert any("no record" in row["note"] for row in engine.store.decisions(4))
+
+
+# -- when the exchange gets in the way ---------------------------------------------------
+
+def test_waits_for_the_close_rather_than_deciding_on_an_old_one(engine, market, clock):
+    market.unpublished.add("ETHEUR")
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
+    assert engine.positions == [] and engine.store.decisions(10) == []
+
+    market.unpublished.clear()
+    clock.advance(60_000)
+    engine.cycle()
+    assert held(engine) == ["BTCEUR"]
+
+
+def test_after_hours_without_a_close_it_decides_without_that_coin(engine, market, clock):
+    market.failing.add("ETHEUR")
+    market.set_close("BTCEUR", UP)
+    clock.advance(GIVE_UP_MS)
+    engine.cycle()
+    assert held(engine) == ["BTCEUR"]
+    assert "ETHEUR" not in actions(engine)
+
+
+def test_a_rejected_order_is_retried_and_reported_once(engine, market, clock):
+    alerts = []
+    engine.notifier.notify = lambda message, level="info": alerts.append(level)
+    real_buy = engine.broker.buy
+    engine.broker.buy = lambda symbol, amount: (_ for _ in ()).throw(VenueError("exchange busy"))
+    market.set_close("BTCEUR", UP)
+
+    engine.cycle()
+    clock.advance(RETRY_MS)
+    engine.cycle()                                   # fails again, quietly
+    assert engine.positions == []
+    assert alerts.count("error") == 1
+
+    engine.broker.buy = real_buy
+    clock.advance(RETRY_MS)
+    engine.cycle()
+    assert held(engine) == ["BTCEUR"]
+
+
+def test_an_unreadable_account_is_retried_not_decided_blind(engine, market, clock):
+    """With no balances the cash looks like zero, and sizing from that would skip the day."""
+    real_balances = engine.broker.balances
+    engine.broker.balances = lambda: (_ for _ in ()).throw(VenueError("timeout"))
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
+    assert engine.positions == [] and engine.store.get("decided_day") is None
+
+    engine.broker.balances = real_balances
+    clock.advance(RETRY_MS)
+    engine.cycle()
+    assert held(engine) == ["BTCEUR"]
+
+
+def test_the_daily_message_goes_out_once_per_decision(engine, market, clock):
+    sent = []
+    engine.notifier.notify = lambda message, level="info": sent.append(message)
+    engine.cycle()
+    clock.advance(60_000)
+    engine.cycle()
+    reports = [message for message in sent if message.startswith("Daily close")]
+    assert len(reports) == 1
+    assert "Equity" in reports[0] and "BTC" in reports[0]
+
+
+# -- restarts ----------------------------------------------------------------------------
+
+def test_a_restart_resumes_holdings_and_does_not_decide_the_same_day_twice(engine, market, tmp_path):
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
+
+    again = build_engine(engine.config.db_path, market)
+    again._restore_positions()
+    again.cycle()
+
+    assert held(again) == ["BTCEUR"]
+    assert again.positions[0].cost == pytest.approx(25.0)
+    assert again.signals["BTCEUR"].on
+    assert len(again.store.decisions(100)) == len(doctrine.SYMBOLS)
+
+
+# -- manual controls ---------------------------------------------------------------------
+
+def test_flatten_sells_everything_and_pauses(engine, market):
+    for symbol in doctrine.SYMBOLS:
+        market.set_close(symbol, UP)
+    engine.cycle()
+    assert engine.flatten("test") == 4
+    assert engine.positions == []
+    assert engine.paused, "otherwise the rule buys straight back in at the next close"
+
+
+def test_closing_one_coin_by_hand(engine, market):
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
+    assert engine.close_one(engine.positions[0].id)
+    assert engine.store.closed_positions()[0]["exit_reason"] == "MANUAL"
 
 
 # -- reconciliation ----------------------------------------------------------------------
 
-def test_engine_defers_to_the_broker_when_a_position_vanishes(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
-
-    # Simulate the coin being sold outside the engine.
+def test_engine_defers_to_the_broker_when_a_position_vanishes(engine, market):
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
     engine.broker._balances["BTC"] = 0.0
     engine.reconcile()
-
     assert engine.positions == []
     assert engine.store.closed_positions()[0]["exit_reason"] == "EXTERNALLY_CLOSED"
 
 
-def test_engine_corrects_a_partially_reduced_position(engine):
-    approve(engine)
-    engine._consider(make_candidate(engine), engine.account_state())
+def test_engine_corrects_a_partially_reduced_position(engine, market):
+    market.set_close("BTCEUR", UP)
+    engine.cycle()
     position = engine.positions[0]
-    # Captured by value: reconcile mutates the position in place, so holding a reference
-    # and comparing it afterwards would compare the object to itself and assert nothing.
-    original_qty = position.qty
-    reduced = original_qty * 0.5
-
-    engine.broker._balances["BTC"] = reduced
+    engine.broker._balances["BTC"] = position.qty * 0.5
     engine.reconcile()
-
-    assert len(engine.positions) == 1
-    assert engine.positions[0].qty == pytest.approx(reduced)
-    assert engine.positions[0].qty < original_qty
+    assert position.qty == pytest.approx(engine.broker._balances["BTC"])
 
 
-# -- accounting --------------------------------------------------------------------------
-
-def test_equity_reflects_realised_results(engine):
-    approve(engine)
-    start = engine.account_state().equity
-    engine._consider(make_candidate(engine), engine.account_state())
-    position = engine.positions[0]
-
-    mark(engine, "BTCEUR", position.entry_price * 1.10)
-    engine._manage_one(position)                        # scale out
-    mark(engine, "BTCEUR", position.entry_price * 1.20)
-    engine._manage_one(position)                        # target or trail
-
-    assert engine.account_state().equity > start
-
-
-# -- lot steps and dust ------------------------------------------------------------------
-#
-# The synthetic market has no lot step, so it can never leave dust. These tests give it
-# Binance's BTCEUR step (0.00001 BTC) so every exit floors the way a real one does.
+# -- books and dust ----------------------------------------------------------------------
+# Exchanges sell in whole lot steps, so a sale floors its quantity and can leave a sliver.
+# These pin that the books still match the cash, and that nothing worth selling is left.
 
 STEP = 0.00001
 
 
 @pytest.fixture
-def stepped(engine):
-    from dataclasses import replace
-
-    engine.instruments = {
-        symbol: replace(instrument, step_size=STEP, min_notional=5.0)
-        for symbol, instrument in engine.market.instruments().items()
-    }
+def stepped(tmp_path, clock):
+    market = TrendMarket(clock, step=STEP)
+    for symbol in doctrine.SYMBOLS:
+        market.closes[symbol] = [50_000.0] * 250
+        market.price[symbol] = 50_000.0
+    engine = build_engine(str(tmp_path / "stepped.db"), market)
+    engine.market_ = market
     return engine
 
 
-def _round_trip(engine, exit_at: str) -> None:
-    engine.store.put("cooldowns", {})               # re-entering the same coin is the point
-    approve(engine)
-    assert engine._consider(make_candidate(engine), engine.account_state())
-    position = engine.positions[0]
-    if exit_at == "scale_then_stop":
-        mark(engine, "BTCEUR", position.entry_price + position.r_unit * 1.05)
-        engine._manage_one(position)
-        assert position.scaled_out
-        mark(engine, "BTCEUR", position.stop * 0.999)
-    elif exit_at == "target":
-        mark(engine, "BTCEUR", position.target * 1.001)
-    else:
-        mark(engine, "BTCEUR", position.stop * 0.999)
-    engine._manage_one(position)
+def _round_trip(engine) -> None:
+    market = engine.market_
+    market.new_day({"BTCEUR": 58_000.0})
+    engine.cycle()
+    assert held(engine) == ["BTCEUR"]
+    market.new_day({"BTCEUR": 40_000.0})
+    engine.cycle()
     assert engine.positions == []
 
 
 def test_books_match_the_cash_across_round_trips_with_lot_steps(stepped):
-    """The regression. Exits floor to the lot step; without a write-off the realised total
-    drifted above the cash by the unsold slivers' cost, and the drawdown halt read the gap
-    as losses — a backtest hit the 20% halt on money that was never lost."""
     start = stepped.config.starting_equity
-    for exit_at in ("target", "stop", "scale_then_stop"):
-        _round_trip(stepped, exit_at)
+    for _ in range(3):
+        _round_trip(stepped)
         cash = stepped.broker.balances()["EUR"]
         assert start + stepped.store.total_realized() == pytest.approx(cash, abs=1e-9)
         assert stepped.account_state().equity == pytest.approx(cash, abs=1e-9)
 
 
 def test_dust_never_accumulates_past_one_lot_step(stepped):
-    for exit_at in ("target", "stop", "scale_then_stop"):
-        _round_trip(stepped, exit_at)
+    for _ in range(3):
+        _round_trip(stepped)
         assert 0 <= stepped.broker.balances().get("BTC", 0.0) < STEP
 
 
-def test_a_final_exit_never_sells_coins_the_engine_did_not_buy(stepped):
+def test_a_sale_never_sells_coins_the_engine_did_not_buy(stepped):
     """Only dust is swept. A holding worth selling on its own is not the engine's to sell."""
-    approve(stepped)
-    stepped._consider(make_candidate(stepped), stepped.account_state())
-    position = stepped.positions[0]
+    market = stepped.market_
+    market.new_day({"BTCEUR": 58_000.0})
+    stepped.cycle()
     owned_by_hand = 0.001                           # ~58 EUR of BTC already in the account
     stepped.broker._balances["BTC"] += owned_by_hand
 
-    mark(stepped, "BTCEUR", position.stop * 0.999)
-    stepped._manage_one(position)
-
+    market.new_day({"BTCEUR": 40_000.0})
+    stepped.cycle()
     assert stepped.positions == []
     assert stepped.broker.balances()["BTC"] == pytest.approx(owned_by_hand, abs=STEP)
 
 
-def test_a_final_exit_asks_for_no_more_than_the_account_holds(stepped):
+def test_a_sale_asks_for_no_more_than_the_account_holds(stepped):
     """Binance takes a buy's fee out of the coins received, so the account can hold a
     little less than the position records. The exchange rejects an over-sized sell whole,
-    and a rejected exit is a stop that never fires."""
-    approve(stepped)
-    stepped._consider(make_candidate(stepped), stepped.account_state())
+    and a rejected sale is a broken trend held."""
+    market = stepped.market_
+    market.new_day({"BTCEUR": 58_000.0})
+    stepped.cycle()
     position = stepped.positions[0]
-    # A hair under the quantity the position records, floored to the step: what selling
-    # the recorded quantity asks for is then more than the account holds.
     floored = int(position.qty / STEP) * STEP
     stepped.broker._balances["BTC"] = floored - STEP / 10
 
     real_sell = stepped.broker.sell
 
     def strict_sell(symbol, qty):
-        from helm.venues.base import VenueError
-
         if qty > stepped.broker.balances()["BTC"] + 1e-15:
             raise VenueError("Account has insufficient balance for requested action.")
         return real_sell(symbol, qty)
 
     stepped.broker.sell = strict_sell
-    mark(stepped, "BTCEUR", position.stop * 0.999)
-    stepped._manage_one(position)
-
+    market.new_day({"BTCEUR": 40_000.0})
+    stepped.cycle()
     assert stepped.positions == []
-    assert stepped.store.closed_positions()[0]["exit_reason"] == "STOP"
+    assert stepped.store.closed_positions()[0]["exit_reason"] == "TREND_OFF"
 
 
-def test_a_short_fill_keeps_the_rest_of_the_position_open(stepped):
-    """A remainder worth selling is a short fill, not dust: it stays managed, not written off."""
-    approve(stepped)
-    stepped._consider(make_candidate(stepped), stepped.account_state())
+def test_a_short_fill_keeps_the_rest_and_sells_it_on_the_retry(stepped, clock):
+    market = stepped.market_
+    market.new_day({"BTCEUR": 58_000.0})
+    stepped.cycle()
     position = stepped.positions[0]
     real_sell = stepped.broker.sell
-    stepped.broker.sell = lambda symbol, qty: real_sell(symbol, qty * 0.5)
+    # Most of it left unsold: worth more than the dust floor, so not written off.
+    stepped.broker.sell = lambda symbol, qty: real_sell(symbol, qty * 0.1)
 
-    mark(stepped, "BTCEUR", position.stop * 0.999)
-    stepped._manage_one(position)
+    market.new_day({"BTCEUR": 40_000.0})
+    stepped.cycle()
+    assert stepped.positions == [position] and position.qty > 0
 
-    assert stepped.positions == [position]
-    assert position.qty > 0
-
-
-def test_scan_produces_rows_for_everything_considered(engine):
-    engine.hunt()
-    rows = engine.snapshot()["scan"]
-    assert rows
-    assert all("regime" in row and "score" in row for row in rows)
+    stepped.broker.sell = real_sell
+    clock.advance(RETRY_MS)
+    stepped.cycle()
+    assert stepped.positions == []
 
 
-# -- scan cadence ------------------------------------------------------------------------
-
-@pytest.mark.parametrize("interval,expected_scans", [(1, 5), (2, 3), (5, 1)])
-def test_scan_interval_is_honoured(engine, interval, expected_scans):
-    """An interval of 1 must mean *every* cycle.
-
-    The natural-looking `cycle % interval == 1` is false for every integer when interval
-    is 1, which silently stops the engine from ever scanning again after the first cycle.
-    """
-    engine.config.scan_every_cycles = interval
-    scans = []
-    engine.hunt = lambda: scans.append(engine._cycle)
-
-    for _ in range(5):
-        engine.cycle()
-
-    assert len(scans) == expected_scans
-    assert scans[0] == 1        # always scan on the first cycle after a restart
-
-
-# -- account aggregates ------------------------------------------------------------------
-
-def test_entries_today_counts_open_and_closed_trades_alike(engine):
-    """The daily cap is about how many times I pulled the trigger.
-
-    Whether a trade has finished yet is irrelevant — counting only closed ones would let
-    three open positions be followed by three more entries on the same day.
-    """
-    approve(engine)
-    engine._consider(make_candidate(engine, "BTCEUR"), engine.account_state())
-    assert engine.account_state().entries_today == 1
-
-    position = engine.positions[0]
-    mark(engine, "BTCEUR", position.stop * 0.999)
-    engine._manage_one(position)                     # now closed
-
-    assert engine.positions == []
-    assert engine.account_state().entries_today == 1  # still counts
-
-    engine.brain._asked.clear()
-    engine._consider(make_candidate(engine, "ETHEUR"), engine.account_state())
-    assert engine.account_state().entries_today == 2
-
-
-def test_realised_aggregates_match_the_full_scan_they_replaced(engine):
-    """The SQL aggregates must agree with summing every row by hand."""
-    approve(engine)
+def test_realised_aggregates_match_the_rows_they_sum(engine, market):
     for symbol in ("BTCEUR", "ETHEUR"):
-        engine.brain._asked.clear()
-        engine._consider(make_candidate(engine, symbol), engine.account_state())
-    for position in list(engine.positions):
-        mark(engine, position.symbol, position.stop * 0.999)
-        engine._manage_one(position)
-
-    by_hand = sum((row.get("realized_pnl") or 0.0) for row in engine.store.all_closed())
+        market.set_close(symbol, UP)
+    engine.cycle()
+    market.new_day({"BTCEUR": DOWN, "ETHEUR": DOWN})
+    engine.cycle()
+    by_hand = sum(row["realized_pnl"] for row in engine.store.all_closed())
     assert engine.store.total_realized() == pytest.approx(by_hand)
     assert engine.store.realized_since(0) == pytest.approx(by_hand)
 
 
-def test_losing_streak_counts_back_from_the_most_recent_trade(engine, tmp_path):
-    from helm.models import Position, now_ms
-
-    for index, pnl in enumerate([-1.0, -1.0, 2.0, -1.0, -1.0]):
-        position = Position(
-            id=f"p{index}", symbol=f"S{index}EUR", venue="sim", qty=1.0, entry_price=100.0,
-            stop=96.0, target=112.0, initial_stop=96.0, initial_qty=1.0, risk_amount=1.5,
-            opened_at=now_ms() + index, setup="TREND_PULLBACK", score=70, conviction=60,
-        )
-        engine.store.open_position(position)
-        position.realized_pnl = pnl
-        engine.store.close_position(position, 100.0, "STOP", pnl / 1.5)
-
-    # Newest two are losses; the win before them ends the streak.
-    assert engine.account_state().consecutive_losses == 2
-
-
-def test_streak_is_stable_when_trades_close_in_the_same_millisecond(engine):
-    """All three positions can exit in one cycle, sharing a closed_at timestamp.
-
-    Without a deterministic tiebreaker SQLite may return them in any order, and the
-    consecutive-loss breaker then counts a scrambled sequence — halting trading when it
-    shouldn't, or missing a real losing streak.
-    """
-    from helm.models import Position
-
-    for index, pnl in enumerate([-1.0, -1.0, 2.0, -1.0, -1.0]):
-        position = Position(
-            id=f"tie{index}", symbol=f"T{index}EUR", venue="sim", qty=1.0, entry_price=100.0,
-            stop=96.0, target=112.0, initial_stop=96.0, initial_qty=1.0, risk_amount=1.5,
-            opened_at=1_000_000 + index, setup="TREND_PULLBACK", score=70, conviction=60,
-        )
-        engine.store.open_position(position)
-        position.realized_pnl = pnl
-        engine.store.close_position(position, 100.0, "STOP", pnl / 1.5)
-    engine.store._write("UPDATE positions SET closed_at = 5000000 WHERE id LIKE 'tie%'")
-
-    # Repeat: a non-deterministic ordering would not fail every run.
-    for _ in range(10):
-        assert engine.account_state().consecutive_losses == 2
+def test_a_position_round_trips_through_the_store(engine):
+    position = Position(id="p1", symbol="BTCEUR", venue="sim", qty=0.5, entry_price=100.0,
+                        initial_qty=0.5, opened_at=1, cost=50.05, entry_close=99.0,
+                        entry_average=95.0, fees_paid=0.05, entry_fee=0.05, last_note="note")
+    engine.store.open_position(position)
+    engine._restore_positions()
+    assert engine.positions[0] == position

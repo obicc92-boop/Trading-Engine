@@ -28,10 +28,12 @@ def client(tmp_path):
 
 def test_state_has_the_shape_the_ui_expects(client):
     body = client.get("/api/state").json()
-    for key in ("phase", "account", "positions", "scan", "doctrine", "blocks", "config"):
+    for key in ("phase", "account", "positions", "coins", "doctrine", "blocks", "config",
+                "next_decision_at"):
         assert key in body
-    for key in ("equity", "cash", "quote", "drawdown", "open_risk"):
+    for key in ("equity", "cash", "invested", "quote", "drawdown", "peak_equity"):
         assert key in body["account"]
+    assert [row["symbol"] for row in body["coins"]] == ["BTCEUR", "ETHEUR", "SOLEUR", "XRPEUR"]
 
 
 def test_state_never_reveals_a_secret(client):

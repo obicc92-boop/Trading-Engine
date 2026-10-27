@@ -27,21 +27,18 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 
+-- One row per coin per daily decision, including the days nothing was done.
 CREATE TABLE IF NOT EXISTS decisions (
     id TEXT PRIMARY KEY,
     ts INTEGER NOT NULL,
+    day INTEGER NOT NULL,
     symbol TEXT NOT NULL,
-    setup TEXT NOT NULL,
-    score REAL NOT NULL,
-    go INTEGER NOT NULL,
-    conviction INTEGER NOT NULL DEFAULT 0,
-    size_multiplier REAL NOT NULL DEFAULT 0,
-    source TEXT NOT NULL DEFAULT 'claude',
-    thesis TEXT NOT NULL DEFAULT '',
-    invalidation TEXT NOT NULL DEFAULT '',
-    blocked_by TEXT NOT NULL DEFAULT '',
-    candidate TEXT NOT NULL DEFAULT '{}',
-    verdict TEXT NOT NULL DEFAULT '{}',
+    close REAL NOT NULL,
+    average REAL NOT NULL,
+    distance REAL NOT NULL,
+    trend_on INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
     position_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts DESC);
@@ -57,20 +54,15 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_price REAL,
     qty REAL NOT NULL,
     initial_qty REAL NOT NULL,
-    stop REAL NOT NULL,
-    initial_stop REAL NOT NULL,
-    target REAL NOT NULL,
-    risk_amount REAL NOT NULL,
-    setup TEXT NOT NULL,
-    score REAL NOT NULL,
-    conviction INTEGER NOT NULL DEFAULT 0,
-    thesis TEXT NOT NULL DEFAULT '',
-    invalidation TEXT NOT NULL DEFAULT '',
+    cost REAL NOT NULL,
+    entry_close REAL NOT NULL DEFAULT 0,
+    entry_average REAL NOT NULL DEFAULT 0,
+    entry_fee REAL NOT NULL DEFAULT 0,
     realized_pnl REAL NOT NULL DEFAULT 0,
     fees_paid REAL NOT NULL DEFAULT 0,
-    r_multiple REAL,
+    return_pct REAL,
     exit_reason TEXT,
-    state TEXT NOT NULL DEFAULT '{}'
+    last_note TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status, opened_at DESC);
 CREATE INDEX IF NOT EXISTS idx_positions_closed ON positions(status, closed_at DESC);
@@ -114,6 +106,14 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
+        columns = {row["name"] for row in self._db.execute("PRAGMA table_info(positions)")}
+        if "setup" in columns:
+            self._db.close()
+            raise RuntimeError(
+                f"{self.path} was written by Helm version 1, whose positions carried stops and "
+                f"targets this version does not have. Point HELM_DB at a new file; the old one "
+                f"is untouched."
+            )
         with self._lock:
             self._db.executescript(SCHEMA)
             self._db.commit()
@@ -170,44 +170,36 @@ class Store:
     def save_decision(self, record: dict[str, Any]) -> None:
         self._write(
             """INSERT INTO decisions
-               (id, ts, symbol, setup, score, go, conviction, size_multiplier, source,
-                thesis, invalidation, blocked_by, candidate, verdict, position_id)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               (id, ts, day, symbol, close, average, distance, trend_on, action, note, position_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record["id"],
                 record.get("ts", now_ms()),
+                int(record["day"]),
                 record["symbol"],
-                record.get("setup", ""),
-                float(record.get("score", 0)),
-                1 if record.get("go") else 0,
-                int(record.get("conviction", 0)),
-                float(record.get("size_multiplier", 0)),
-                record.get("source", "claude"),
-                record.get("thesis", ""),
-                record.get("invalidation", ""),
-                record.get("blocked_by", ""),
-                json.dumps(clean(record.get("candidate", {}))),
-                json.dumps(clean(record.get("verdict", {}))),
+                float(record["close"]),
+                float(record["average"]),
+                float(record["distance"]),
+                1 if record["on"] else 0,
+                record["action"],
+                record.get("note", ""),
                 record.get("position_id"),
             ),
         )
 
     def decisions(self, limit: int = 60) -> list[dict[str, Any]]:
-        rows = self._rows("SELECT * FROM decisions ORDER BY ts DESC LIMIT ?", (limit,))
+        rows = self._rows("SELECT * FROM decisions ORDER BY ts DESC, rowid DESC LIMIT ?", (limit,))
         for row in rows:
-            row["go"] = bool(row["go"])
-            row["candidate"] = json.loads(row["candidate"])
-            row["verdict"] = json.loads(row["verdict"])
+            row["on"] = bool(row.pop("trend_on"))
         return rows
 
     # -- positions -----------------------------------------------------------------------
     def open_position(self, position: Position) -> None:
         self._write(
             """INSERT INTO positions
-               (id, symbol, venue, status, opened_at, entry_price, qty, initial_qty, stop,
-                initial_stop, target, risk_amount, setup, score, conviction, thesis,
-                invalidation, state)
-               VALUES(?,?,?,'OPEN',?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               (id, symbol, venue, status, opened_at, entry_price, qty, initial_qty, cost,
+                entry_close, entry_average, entry_fee, fees_paid, last_note)
+               VALUES(?,?,?,'OPEN',?,?,?,?,?,?,?,?,?,?)""",
             (
                 position.id,
                 position.symbol,
@@ -216,70 +208,42 @@ class Store:
                 position.entry_price,
                 position.qty,
                 position.initial_qty,
-                position.stop,
-                position.initial_stop,
-                position.target,
-                position.risk_amount,
-                position.setup,
-                position.score,
-                position.conviction,
-                position.thesis,
-                position.invalidation,
-                "{}",
+                position.cost,
+                position.entry_close,
+                position.entry_average,
+                position.entry_fee,
+                position.fees_paid,
+                position.last_note,
             ),
         )
 
     def sync_position(self, position: Position) -> None:
-        """Persist the mutable half of a live position after every cycle.
-
-        Cheap, and it means a restart resumes management of open trades exactly where it
-        left off rather than rebuilding a plan from scratch.
-        """
+        """Persist the mutable half of a live position, so a restart resumes it exactly."""
         self._write(
-            """UPDATE positions SET qty=?, stop=?, target=?, realized_pnl=?, fees_paid=?,
-               state=? WHERE id=?""",
-            (
-                position.qty,
-                position.stop,
-                position.target,
-                position.realized_pnl,
-                position.fees_paid,
-                json.dumps(
-                    {
-                        "scaled_out": position.scaled_out,
-                        "breakeven_set": position.breakeven_set,
-                        "highest_close": position.highest_close,
-                        "regime_break_closes": position.regime_break_closes,
-                        "regime_bar_time": position.regime_bar_time,
-                        "last_note": position.last_note,
-                    }
-                ),
-                position.id,
-            ),
+            "UPDATE positions SET qty=?, realized_pnl=?, fees_paid=?, last_note=? WHERE id=?",
+            (position.qty, position.realized_pnl, position.fees_paid, position.last_note, position.id),
         )
 
-    def close_position(
-        self, position: Position, exit_price: float, reason: str, r_multiple: float
-    ) -> None:
+    def close_position(self, position: Position, exit_price: float, reason: str) -> None:
+        """`return_pct` is the result against what the purchase cost, fees on both legs in."""
+        return_pct = position.realized_pnl / position.cost * 100 if position.cost else 0.0
         self._write(
             """UPDATE positions SET status='CLOSED', closed_at=?, exit_price=?, qty=0,
-               realized_pnl=?, fees_paid=?, exit_reason=?, r_multiple=? WHERE id=?""",
+               realized_pnl=?, fees_paid=?, exit_reason=?, return_pct=?, last_note=? WHERE id=?""",
             (
                 now_ms(),
                 exit_price,
                 position.realized_pnl,
                 position.fees_paid,
                 reason,
-                r_multiple,
+                return_pct,
+                position.last_note,
                 position.id,
             ),
         )
 
     def load_open_positions(self) -> list[dict[str, Any]]:
-        rows = self._rows("SELECT * FROM positions WHERE status='OPEN' ORDER BY opened_at")
-        for row in rows:
-            row["state"] = json.loads(row["state"] or "{}")
-        return rows
+        return self._rows("SELECT * FROM positions WHERE status='OPEN' ORDER BY opened_at")
 
     def closed_positions(self, limit: int = 100) -> list[dict[str, Any]]:
         return self._rows(
@@ -310,29 +274,6 @@ class Store:
             "SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM positions WHERE status='CLOSED'"
         )
         return float(row["total"]) if row else 0.0
-
-    def entries_since(self, since_ms: float) -> int:
-        row = self._row(
-            "SELECT COUNT(*) AS n FROM positions WHERE opened_at >= ?", (since_ms,)
-        )
-        return int(row["n"]) if row else 0
-
-    def recent_results(self, limit: int = 20) -> list[float]:
-        """The last N realised results, newest first — enough to measure a losing streak.
-
-        Bounded deliberately: a streak longer than this would have tripped a circuit
-        breaker long before, so there is nothing further back worth reading.
-        """
-        # `rowid DESC` breaks ties on closed_at. Several positions routinely close within
-        # the same millisecond — all three can exit in one cycle — and without a stable
-        # tiebreaker SQLite is free to return them in any order, which scrambles the streak
-        # the consecutive-loss breaker is counting.
-        rows = self._rows(
-            "SELECT realized_pnl FROM positions WHERE status='CLOSED' "
-            "ORDER BY closed_at DESC, rowid DESC LIMIT ?",
-            (limit,),
-        )
-        return [float(row["realized_pnl"] or 0.0) for row in rows]
 
     # -- fills ---------------------------------------------------------------------------
     def save_fill(self, fill_id: str, position_id: str | None, fill: Any, reason: str) -> None:

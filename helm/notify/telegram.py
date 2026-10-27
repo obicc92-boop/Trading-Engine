@@ -9,9 +9,9 @@ stall the cycle is worse than no notifier at all — the whole point is to watch
 is managing real money without you.
 
 Inbound commands are polled on a second thread and are locked to one Telegram user. They
-can pause, flatten and kill, but they cannot open a position or loosen a limit. The worst
-a leaked token can do is close trades early, which costs opportunity rather than capital —
-an acceptable price for being able to hit the brakes from a phone.
+can pause, flatten and kill, but they cannot buy or loosen a limit. The worst a leaked token
+can do is sell early, which costs opportunity rather than capital — an acceptable price for
+being able to hit the brakes from a phone.
 """
 
 from __future__ import annotations
@@ -29,9 +29,8 @@ log = logging.getLogger("helm.telegram")
 
 API = "https://api.telegram.org"
 
-# Which narration levels are worth a phone buzz. `info`, `think` and `pass` are the engine
-# talking to itself — every cycle produces some, and forwarding them would train you to
-# ignore the channel within a day.
+# Which narration levels are worth a phone buzz. `info` is the engine talking to itself —
+# forwarding it would train you to ignore the channel within a day.
 ALERT_LEVELS = {"entry", "win", "loss", "warn", "error"}
 
 ICONS = {
@@ -75,7 +74,13 @@ class TelegramNotifier:
         return bool(self.token and self.chat_id)
 
     # -- lifecycle -----------------------------------------------------------------------
-    def start(self, handlers: dict[str, Callable[[], str]] | None = None) -> None:
+    def start(
+        self,
+        handlers: dict[str, Callable[[], str]] | None = None,
+        menu: dict[str, str] | None = None,
+    ) -> None:
+        """Start sending, and answering commands. `menu` maps each command to the one-line
+        description Telegram shows when "/" is typed."""
         if not self.enabled:
             log.info("telegram not configured — no alerts will be sent")
             return
@@ -89,8 +94,20 @@ class TelegramNotifier:
             # Skip whatever arrived while the engine was down. Acting on a `/flatten` sent
             # six hours ago, for a position that no longer exists, is worse than ignoring it.
             self._discard_backlog()
+            if menu:
+                self._set_menu(menu)
             self._poller = threading.Thread(target=self._poll, name="helm-tg-poll", daemon=True)
             self._poller.start()
+
+    def _set_menu(self, menu: dict[str, str]) -> None:
+        """Register the command menu from the code, so it cannot drift from what is answered."""
+        try:
+            self._client.post(
+                f"{API}/bot{self.token}/setMyCommands",
+                json={"commands": [{"command": name, "description": text} for name, text in menu.items()]},
+            )
+        except Exception as exc:
+            log.debug("could not set the telegram command menu: %s", exc)
 
     def stop(self) -> None:
         self._stop.set()

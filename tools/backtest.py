@@ -1,27 +1,27 @@
-"""Backtest — the doctrine's rules replayed against real Binance history.
+"""Backtest — the doctrine's rule replayed against real Binance history.
 
-Runs the real `Engine.cycle()` over months of actual prices on a simulated clock: the real
-scanner, risk rails, sizing, exit ladder, fees and slippage. Two things are substituted —
-the market (recorded candles instead of a live feed) and the decision layer.
+Runs the real `Engine.cycle()` once a day, a minute after midnight UTC on a simulated
+clock: the real rule, sizing, sales-before-purchases, the 70% halt, the books, fees and
+slippage. Only the market is substituted — recorded daily candles instead of a live feed.
 
 WHAT THIS MEASURES
-    Whether the mechanical rules have an edge on the markets you would trade: how often they
-    trade, the win rate, expectancy in R, the drawdown, and how all of that moves over time.
+    Whether the code trades the rule as tested: the result, the worst drop, how often it
+    trades and how much of the time it is invested, against simply holding the same coins.
+    The research behind doctrine v2 used a separate script; this is the engine itself, so
+    the two should agree, and a gap between them is a bug in one or the other.
 
 WHAT IT DOES NOT
-    The decision layer. Every candidate the rails allow is approved at full size, so this is
-    the rules with no judgement on top. The model can only veto or shrink, so the live system
-    takes a subset of these trades. Replaying it would cost one paid API call per candidate,
-    and a model asked about the past may already know how it ended.
+    Fills are at the day's opening price plus the simulated broker's slippage and the taker
+    fee — the moment the live engine acts, just after the close. That is a model of a fill,
+    not a fill, and on a crash day the real one can be worse.
 
-    Fills are at the one-minute close, plus the simulated broker's slippage and the taker fee.
-    That matches how the live engine works — it watches its stops on a 60s loop rather than
-    resting them on the exchange — but it is still a model of a fill, not a fill.
+    One period is one sample. Crypto has a short history and only a few full cycles; a
+    result is evidence about that stretch of market, not a forecast, and must never be
+    quoted as one.
 
-    One period is one sample. A result is evidence about that stretch of market, not a
-    forecast, and must never be quoted as one.
-
-    python tools/backtest.py --days 180
+    python tools/backtest.py                              the doctrine's coins, all history
+    python tools/backtest.py --start 2026-04-30           from a date
+    python tools/backtest.py --symbols BTCUSDT,ETHUSDT    an experiment, labelled as one
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -41,25 +41,15 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import soak  # noqa: E402  — the simulated clock and database handling are shared
 from helm import doctrine  # noqa: E402
-from helm.analysis import setups  # noqa: E402
 from helm.config import Config  # noqa: E402
-from helm.models import Candles, Instrument, Quote, Verdict  # noqa: E402
+from helm.engine import GIVE_UP_MS  # noqa: E402
+from helm.models import Candles, Instrument, Quote  # noqa: E402
 from helm.venues.base import VenueError  # noqa: E402
 
 BINANCE = "https://api.binance.com"
 MINUTE = 60_000
-TF_MS = {"1m": MINUTE, "15m": 15 * MINUTE, "1h": 60 * MINUTE, "4h": 240 * MINUTE}
-
-# The doctrine's setups, by the name trades are recorded under, and their detectors.
-SETUPS = {
-    "TREND_PULLBACK": "_trend_pullback",
-    "SQUEEZE_BREAKOUT": "_squeeze_breakout",
-    "CAPITULATION_REVERSAL": "_capitulation_reversal",
-}
-
-# Closed bars of history needed before the first simulated minute. The engine asks for at
-# most 250 on any timeframe; the margin keeps the first scan from running short.
-WARMUP_BARS = {doctrine.REGIME_TF: 260, doctrine.STRUCTURE_TF: 260, doctrine.TRIGGER_TF: 130}
+DAY = 86_400_000
+TF_MS = {"1d": DAY}
 
 # Downloads are cached here (inside data/, so never committed). Files are named by the
 # window they hold, and history does not change, so a cached file never goes stale.
@@ -106,156 +96,110 @@ def klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> Candles:
 
 
 class HistoricalMarket:
-    """Recorded candles, served as of the simulated clock.
+    """Recorded daily candles, served as of the simulated clock.
 
-    Only bars that had closed by then are visible — the same view a live feed gives, which
-    drops the still-forming bar. Anything looser lets the future leak into a decision, and a
-    backtest with a leak in it is worse than none, because it is convincing.
+    Only days that had closed by then are visible — the same view a live feed gives, which
+    drops the still-forming candle. The price is the day in progress's opening price: what
+    the market was at the moment the engine acts. Anything looser lets the future leak into
+    a decision, and a backtest with a leak in it is worse than none, because it is convincing.
     """
 
     name = "historical"
 
-    def __init__(self, series: dict[str, dict[str, Candles]], instruments: dict[str, Instrument]) -> None:
+    def __init__(self, series: dict[str, Candles], instruments: dict[str, Instrument]) -> None:
         self._series = series
         self._instruments = instruments
-        self._closes_at = {
-            symbol: {tf: bars.open_time + TF_MS[tf] for tf, bars in frames.items()}
-            for symbol, frames in series.items()
-        }
-        # 24h quote volume from one-minute bars, as a running sum so each quote is O(1).
-        self._volume_sum = {
-            symbol: np.concatenate(([0.0], np.cumsum(frames["1m"].close * frames["1m"].volume)))
-            for symbol, frames in series.items()
-        }
 
-    def _closed(self, symbol: str, timeframe: str) -> int:
-        return int(np.searchsorted(self._closes_at[symbol][timeframe], soak.CLOCK[0], side="right"))
+    def _closed(self, symbol: str) -> int:
+        bars = self._series[symbol]
+        return int(np.searchsorted(bars.open_time + DAY, soak.CLOCK[0], side="right"))
 
     def instruments(self) -> dict[str, Instrument]:
         return self._instruments
 
     def quotes(self) -> dict[str, Quote]:
         out: dict[str, Quote] = {}
-        for symbol, frames in self._series.items():
-            k = self._closed(symbol, "1m")
+        for symbol, bars in self._series.items():
+            k = self._closed(symbol)
             if k == 0:
                 continue
-            minutes = frames["1m"]
-            price = float(minutes.close[k - 1])
-            day_ago = max(0, k - 1440)
-            out[symbol] = Quote(
-                symbol=symbol,
-                price=price,
-                quote_volume_24h=float(self._volume_sum[symbol][k] - self._volume_sum[symbol][day_ago]),
-                change_24h_pct=(price / float(minutes.close[day_ago]) - 1) * 100,
-            )
+            forming = k < len(bars) and bars.open_time[k] <= soak.CLOCK[0]
+            price = float(bars.open[k]) if forming else float(bars.close[k - 1])
+            out[symbol] = Quote(symbol=symbol, price=price)
         return out
 
     def candles(self, symbol: str, timeframe: str, limit: int = 300) -> Candles:
-        frames = self._series.get(symbol)
-        if frames is None or timeframe not in frames:
+        bars = self._series.get(symbol)
+        if bars is None or timeframe != doctrine.TREND_TF:
             raise VenueError(f"no {timeframe} history for {symbol}")
-        k = self._closed(symbol, timeframe)
+        k = self._closed(symbol)
         if k == 0:
-            raise VenueError(f"no closed {timeframe} bars for {symbol} yet")
-        bars, lo = frames[timeframe], max(0, k - limit)
+            raise VenueError(f"no closed days for {symbol} yet")
+        lo = max(0, k - limit)
         return Candles(symbol=symbol, timeframe=timeframe, open_time=bars.open_time[lo:k],
                        open=bars.open[lo:k], high=bars.high[lo:k], low=bars.low[lo:k],
                        close=bars.close[lo:k], volume=bars.volume[lo:k])
-
-    def listing_age_days(self, symbol: str) -> float:
-        return 9999.0
-
-
-class RulesOnlyDesk:
-    """Stands in for the decision layer: whatever the rails allow is taken at full size.
-
-    The most generous desk possible, which is the point — it measures the rules alone. The
-    real model can only remove trades from this set or make them smaller.
-    """
-
-    def __init__(self) -> None:
-        self.asked = 0
-
-    def __call__(self, candidate, state, recent, scan) -> Verdict:
-        self.asked += 1
-        return Verdict(go=True, conviction=int(candidate.score), size_multiplier=1.0,
-                       stop_override=None,
-                       thesis=f"Backtest: rules-only approval at score {candidate.score:.0f}.",
-                       invalidation="", source="backtest")
-
-
-def load_history(symbols: list[str], start: int, end: int) -> dict[str, dict[str, Candles]]:
-    series: dict[str, dict[str, Candles]] = {}
-    for symbol in symbols:
-        frames = {}
-        for tf, bars in WARMUP_BARS.items():
-            frames[tf] = klines(symbol, tf, start - bars * TF_MS[tf], end)
-        # One day of minutes before the start, so the first quote has a 24h volume.
-        frames["1m"] = klines(symbol, "1m", start - 1440 * MINUTE, end)
-        series[symbol] = frames
-        print(f"  {symbol:10s} {len(frames['1m']):,} one-minute bars")
-    return series
 
 
 def _date(ms: float) -> str:
     return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d")
 
 
-def _summary(rows: list[dict]) -> str:
-    if not rows:
-        return "   0"
-    r = [row["r_multiple"] or 0.0 for row in rows]
-    wins = sum(1 for value in r if value > 0)
-    return f"{len(rows):4d}   {wins / len(rows) * 100:3.0f}%   {sum(r) / len(r):+.2f}R"
+def _ms(day: str) -> int:
+    return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=180)
+    parser.add_argument("--start", default=None,
+                        help="first day to trade, YYYY-MM-DD. Defaults to the first day every "
+                             f"coin has {doctrine.SMA_DAYS} closed days behind it")
     parser.add_argument("--end", default=None,
                         help="last day of the window, YYYY-MM-DD (exclusive). Defaults to today "
-                             "UTC, so the window is whole days of closed bars")
-    parser.add_argument("--symbols", default="BTCEUR,ETHEUR,SOLEUR,XRPEUR")
-    parser.add_argument("--quote", default="EUR")
+                             "UTC, so every day replayed has closed")
+    parser.add_argument("--symbols", default=None,
+                        help="experiment: trade these instead of the doctrine's coins, a "
+                             "1/n share each, e.g. BTCUSDT,ETHUSDT for history before EUR pairs")
     parser.add_argument("--equity", type=float, default=100.0)
-    parser.add_argument("--scan-minutes", type=int, default=5,
-                        help="minutes between scans; the live engine scans every 5 cycles of 60s")
     parser.add_argument("--db", default="/tmp/helm-backtest/backtest.db")
     parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                         help="experiment: replace a numeric doctrine constant for this run "
-                             "only, e.g. --set TIME_STOP_HOURS=48. Repeatable. Exists only "
-                             "here — the engine itself has no way to change a rule")
-    parser.add_argument("--without", action="append", default=[], choices=sorted(SETUPS),
-                        help="experiment: switch one of the doctrine's setups off for this run")
+                             "only, e.g. --set SMA_DAYS=150. Repeatable. Exists only here — "
+                             "the engine itself has no way to change a rule")
     parser.add_argument("--fee", type=float, default=None,
                         help="taker fee as a fraction, e.g. 0.00075 for Binance with fees paid "
                              "in BNB. Defaults to HELM_TAKER_FEE (0.001)")
     args = parser.parse_args()
 
-    overrides = []
+    experiments = []
+    if args.symbols:
+        symbols = tuple(s.strip().upper() for s in args.symbols.split(",") if s.strip())
+        quotes = {next((q for q in ("EUR", "USDT", "USDC") if s.endswith(q)), "") for s in symbols}
+        if len(quotes) != 1 or "" in quotes:
+            raise SystemExit("--symbols must all share one quote currency: EUR, USDT or USDC")
+        doctrine.SYMBOLS, doctrine.QUOTE = symbols, quotes.pop()
+        doctrine.ENTRY_FRACTION = 1 / len(symbols)
+        experiments.append(f"coins {', '.join(symbols)}, 1/{len(symbols)} of the account each")
     for item in args.set:
         name, _, value = item.partition("=")
         current = getattr(doctrine, name, None)
         if isinstance(current, bool) or not isinstance(current, (int, float)):
             raise SystemExit(f"--set {item}: doctrine has no numeric constant called {name}")
         setattr(doctrine, name, type(current)(float(value)))
-        overrides.append(f"{name} {current} -> {getattr(doctrine, name)}")
-    for name in args.without:
-        # detect() looks each detector up by name on every call, so this takes effect.
-        setattr(setups, SETUPS[name], lambda *args, **kwargs: None)
-        overrides.append(f"{name} switched off")
+        experiments.append(f"{name} {current} -> {getattr(doctrine, name)}")
+    symbols, quote = doctrine.SYMBOLS, doctrine.QUOTE
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    if args.end:
-        end_day = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    else:
-        end_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    end = int(end_day.timestamp() * 1000)
-    start = int((end_day - timedelta(days=args.days)).timestamp() * 1000)
+    end = _ms(args.end) if args.end else int(
+        datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    print(f"loading daily history for {', '.join(symbols)}")
+    series = {symbol: klines(symbol, "1d", 0, end) for symbol in symbols}
+    for symbol, bars in series.items():
+        print(f"  {symbol:10s} {len(bars):5d} days from {_date(bars.open_time[0])}")
 
-    print(f"loading {args.days} days of history, {_date(start)} to {_date(end)}")
-    series = load_history(symbols, start, end)
+    earliest = max(int(bars.open_time[doctrine.SMA_DAYS]) for bars in series.values())
+    start = max(_ms(args.start), earliest) if args.start else earliest
+    if start >= end:
+        raise SystemExit("nothing to replay: the window ends before the rule has enough history")
 
     soak.clear_database(Path(args.db))
     import helm.engine as engine_module
@@ -267,136 +211,117 @@ def main() -> int:
     config = Config()
     config.db_path = args.db
     config.venue = "synthetic"        # builds the simulated broker; the market is swapped below
-    config.quote = args.quote
-    config.symbols = symbols
+    config.quote = quote
     config.starting_equity = args.equity
     if args.fee is not None:
         config.taker_fee = args.fee
-    config.scan_every_cycles = 1      # scan cadence is set by the loop below instead
-    config.anthropic_key = ""         # the desk below decides; nothing may reach the real API
-    config.telegram_token = ""        # and a backtest must never page anyone
+    config.telegram_token = ""        # a backtest must never page anyone
 
     venue = BinanceVenue(config).instruments()
-    instruments = {symbol: venue[symbol] for symbol in symbols if symbol in venue}
-    market = HistoricalMarket(series, instruments)
+    market = HistoricalMarket(series, {s: venue[s] for s in symbols if s in venue})
 
     engine = engine_module.Engine(config)
-    engine.market = engine.scanner.market = engine.broker.market = market
+    engine.market = engine.broker.market = market
     engine.synthetic = False
-    desk = RulesOnlyDesk()
-    engine.brain.judge_entry = desk
 
     began = time.time()
+    days = list(range(start, end, DAY))
+    curve: list[tuple[int, float, float]] = []      # (day, equity, invested)
+    late = 0
     halted_at = None
-    max_dd = 0.0
-    total_minutes = (end - start) // MINUTE
-    print(f"\nreplaying {total_minutes:,} minutes, scanning every {args.scan_minutes}\n")
+    print(f"\nreplaying {len(days):,} days, {_date(start)} to {_date(end - DAY)}\n")
 
-    for i in range(1, total_minutes + 1):
-        soak.CLOCK[0] = start + i * MINUTE
-        if i % args.scan_minutes == 0:
+    for i, day in enumerate(days):
+        soak.CLOCK[0] = day + MINUTE
+        engine.cycle()
+        if int(engine.store.get("decided_day", 0) or 0) < day - DAY:
+            # A coin's candle is missing from the record. Live, the engine waits a few hours
+            # and then decides without it; so does the replay.
+            soak.CLOCK[0] = day + GIVE_UP_MS + MINUTE
             engine.cycle()
-            # The engine's own measure — from the realized peak, as the hard halt reads it —
-            # rather than one rebuilt from the equity curve, which would disagree with it.
-            max_dd = max(max_dd, engine.account_state().drawdown)
-        elif engine.positions:
-            # Between scans the live engine still runs a cycle every minute, and for an open
-            # position that is what matters: the stop is checked against the latest price.
-            engine.refresh_prices()
-            engine.manage_positions()
-
+            late += 1
+        state = engine.account_state()
+        curve.append((day, state.equity, state.invested))
         if engine.halted and halted_at is None:
-            halted_at = (soak.CLOCK[0], engine.halt_reason)
+            halted_at = (day, engine.halt_reason)
+        if i % max(1, len(days) // 10) == 0:
+            print(f"  {_date(day)}  equity {state.equity:9.2f}  held {len(engine.positions)}  "
+                  f"closed {len(engine.store.all_closed()):3d}")
 
-        if i % (total_minutes // 10) == 0:
-            state = engine.account_state()
-            print(f"  {_date(soak.CLOCK[0])}  equity {state.equity:7.2f}  open {len(engine.positions)}  "
-                  f"closed {len(engine.store.all_closed()):3d}  dd {state.drawdown * 100:4.1f}%")
+    # The last day's close: where the account stands at the end of the window.
+    soak.CLOCK[0] = end
+    engine.refresh_prices()
+    final = engine.account_state()
+    curve.append((end, final.equity, final.invested))
 
     # ---- report --------------------------------------------------------------------------
-    closed = engine.store.all_closed()
-    state = engine.account_state()
+    equity = np.array([row[1] for row in curve])
+    peak = np.maximum.accumulate(equity)
+    drawdowns = 1 - equity / peak
+    worst = int(np.argmax(drawdowns))
+    exposure = float(np.mean([row[2] / row[1] for row in curve if row[1] > 0]))
+    years = (end - start) / DAY / 365.25
 
-    # Coins left in the account that no open position accounts for: the slivers exits
-    # cannot sell. Equity leaves them out, so they are shown on their own — a few cents is
-    # normal, and anything more means exits are leaving money behind again.
-    balances = engine.broker.balances()
-    in_positions: dict[str, float] = {}
-    for position in engine.positions:
-        base = engine._base_of(position.symbol)
-        in_positions[base] = in_positions.get(base, 0.0) + position.qty
-    dust = sum(
-        (balances.get(engine._base_of(symbol), 0.0) - in_positions.get(engine._base_of(symbol), 0.0))
-        * engine._price_of(symbol)
-        for symbol in symbols
-    )
+    closed = engine.store.all_closed()
+    fills = engine.store.fills(1_000_000)
+    fees = sum(row["fee"] for row in fills)
 
     holds = {}
-    for symbol, frames in series.items():
-        minutes = frames["1m"]
-        first = minutes.close[int(np.searchsorted(minutes.open_time, start))]
-        holds[symbol] = (minutes.close[-1] / first - 1) * 100
+    for symbol, bars in series.items():
+        first = int(np.searchsorted(bars.open_time, start))
+        bought = (1 - config.taker_fee) / (bars.open[first] * (1 + engine.broker.slippage))
+        holds[symbol] = bought * bars.close[-1]
+    hold_end = args.equity * sum(holds.values()) / len(holds)
+    hold_curve = sum(
+        series[s].close[np.searchsorted(series[s].open_time, start):] /
+        series[s].open[np.searchsorted(series[s].open_time, start)] for s in symbols
+    )
+    hold_dd = float(np.max(1 - hold_curve / np.maximum.accumulate(hold_curve)))
 
-    print("\n" + "=" * 64)
+    print("\n" + "=" * 66)
     print(f"BACKTEST   {', '.join(symbols)}")
-    print(f"           {_date(start)} to {_date(end)} ({args.days} days)")
-    print("=" * 64)
-    print("  rules only — no decision layer. Fills at the 1m close, "
-          f"{engine.broker.slippage * 1e4:.0f}bps slippage, {config.taker_fee * 100:.3f}% fee.")
-    for change in overrides:
+    print(f"           {_date(start)} to {_date(end - DAY)} ({len(days)} days, {years:.1f} years)")
+    print("=" * 66)
+    print(f"  doctrine v{doctrine.VERSION}: hold while the daily close is above the "
+          f"{doctrine.SMA_DAYS}-day average.")
+    print(f"  Fills at the day's open, {engine.broker.slippage * 1e4:.0f}bps slippage, "
+          f"{config.taker_fee * 100:.3f}% fee.")
+    for change in experiments:
         print(f"  EXPERIMENT — not the doctrine: {change}")
 
-    print(f"\n  starting equity    {args.equity:8.2f} {args.quote}")
-    print(f"  ending equity      {state.equity:8.2f} {args.quote}   "
-          f"({(state.equity / args.equity - 1) * 100:+.1f}%)")
-    print(f"  left as dust       {dust:8.2f} {args.quote}   (unsellable slivers, outside equity)")
-    print(f"  max drawdown       {max_dd * 100:7.1f}%")
+    print(f"\n  starting equity    {args.equity:10.2f} {quote}")
+    print(f"  ending equity      {final.equity:10.2f} {quote}   ({(final.equity / args.equity - 1) * 100:+.0f}%, "
+          f"{((final.equity / args.equity) ** (1 / years) - 1) * 100:+.1f}% a year)")
+    print(f"  worst drop         {drawdowns[worst] * 100:9.0f}%    (to {_date(curve[worst][0])})")
     print(f"  hard halt          {'never' if not halted_at else _date(halted_at[0]) + ' — ' + halted_at[1]}")
-    print(f"  buy and hold       " + "   ".join(f"{s[:-len(args.quote)]} {v:+.0f}%" for s, v in holds.items())
-          + f"   (equal weight {sum(holds.values()) / len(holds):+.1f}%)")
+    print(f"  invested           {exposure * 100:9.0f}%    of the time, on average")
+    print(f"  buy and hold       {hold_end:10.2f} {quote}   ({(hold_end / args.equity - 1) * 100:+.0f}%), "
+          f"worst drop {hold_dd * 100:.0f}%")
+    if late:
+        print(f"  days decided late  {late:10d}    (a coin's candle missing from the record)")
 
-    print("\n" + "-" * 64)
-    if not closed:
-        print("  no trades closed in this window")
-        print(f"\n  ran in {time.time() - began:.0f}s\n")
-        return 0
+    print("\n" + "-" * 66)
+    trades = len(closed) + len(engine.positions)
+    print(f"  trades             {trades:5d}   ({trades / max(1, len(days) / 30.44):.1f} a month)")
+    print(f"  fees paid          {fees:8.2f} {quote}")
+    if closed:
+        returns = [row["return_pct"] or 0.0 for row in closed]
+        held = sorted(((row["closed_at"] or 0) - (row["opened_at"] or 0)) / DAY for row in closed)
+        wins = [value for value in returns if value > 0]
+        print(f"  closed trades      {len(closed):5d}   {len(wins) / len(closed) * 100:.0f}% won, "
+              f"average {sum(returns) / len(returns):+.1f}%")
+        print(f"  best / worst       {max(returns):+.0f}% / {min(returns):+.0f}%")
+        print(f"  median hold        {held[len(held) // 2]:5.0f} days")
 
-    r = [row["r_multiple"] or 0.0 for row in closed]
-    wins = [value for value in r if value > 0]
-    losses = [value for value in r if value <= 0]
-    gross_win = sum(row["realized_pnl"] for row in closed if row["realized_pnl"] > 0)
-    gross_loss = -sum(row["realized_pnl"] for row in closed if row["realized_pnl"] <= 0)
-    fees = sum(row["fees_paid"] or 0.0 for row in closed)
-    holding = sorted(((row["closed_at"] or 0) - (row["opened_at"] or 0)) / 3_600_000 for row in closed)
-
-    print(f"  trades             {len(closed):5d}   ({len(closed) / (args.days / 7):.1f} a week)")
-    print(f"  win rate           {len(wins) / len(r) * 100:5.0f}%")
-    print(f"  expectancy         {sum(r) / len(r):+.2f}R a trade")
-    print(f"  profit factor      {gross_win / gross_loss if gross_loss else float('inf'):5.2f}")
-    print(f"  average win/loss   {(sum(wins) / len(wins) if wins else 0):+.2f}R / "
-          f"{(sum(losses) / len(losses) if losses else 0):+.2f}R")
-    print(f"  best / worst       {max(r):+.2f}R / {min(r):+.2f}R")
-    print(f"  fees paid          {fees:6.2f} {args.quote}   ({fees / args.equity * 100:.1f}% of starting equity)")
-    print(f"  median hold        {holding[len(holding) // 2]:5.1f}h")
-    print(f"  sent to the desk   {desk.asked:5d}   (each one a paid model call when live)")
-
-    for title, key in (("BY SETUP", "setup"), ("BY SYMBOL", "symbol")):
-        print(f"\n  {title:18s} trades   win   expectancy")
-        for value in sorted({row[key] for row in closed}):
-            print(f"    {value:22s} {_summary([row for row in closed if row[key] == value])}")
-
-    print("\n  BY MONTH           trades   win   expectancy      P&L")
-    for month in sorted({_date(row["closed_at"])[:7] for row in closed}):
-        rows = [row for row in closed if _date(row["closed_at"]).startswith(month)]
-        pnl = sum(row["realized_pnl"] for row in rows)
-        print(f"    {month:22s} {_summary(rows)}   {pnl:+7.2f}")
-
-    print("\n  EXIT REASONS")
-    reasons: dict[str, list[float]] = {}
-    for row in closed:
-        reasons.setdefault(row["exit_reason"], []).append(row["r_multiple"] or 0.0)
-    for reason, values in sorted(reasons.items(), key=lambda kv: -len(kv[1])):
-        print(f"    {reason.lower().replace('_', ' '):22s} {len(values):4d}   avg {sum(values) / len(values):+.2f}R")
+    print("\n  BY YEAR            rule      hold")
+    by_year: dict[str, list[int]] = {}
+    for index, (day, _, _) in enumerate(curve):
+        by_year.setdefault(_date(day)[:4], []).append(index)
+    for year, indexes in by_year.items():
+        before = indexes[0] - 1 if indexes[0] > 0 else 0
+        rule = equity[indexes[-1]] / equity[before] - 1
+        hold = hold_curve[min(indexes[-1], len(hold_curve) - 1)] / hold_curve[before] - 1
+        print(f"    {year}           {rule * 100:+6.0f}%   {hold * 100:+6.0f}%")
 
     print(f"\n  ran in {time.time() - began:.0f}s\n")
     return 0

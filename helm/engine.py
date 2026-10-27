@@ -1,16 +1,18 @@
 """The engine loop.
 
-One cycle, in this order, every time:
+Every cycle, in this order:
 
-    reconcile -> manage open positions -> scan -> decide -> execute -> record -> broadcast
+    reconcile -> record -> (once a day) read the close -> sell -> buy -> report -> broadcast
 
-Open positions are managed *before* anything new is considered, because protecting money
-already at risk beats finding somewhere else to put it. The scan runs on a slower cadence
-than the loop, since candles do not change every sixty seconds and API quota is finite.
+The loop runs every minute, because the account has to be watched and the dashboard kept
+live, but the rule acts once a day: the first cycle after a daily candle closes reads it,
+sells whatever has closed below its average, then buys whatever has closed above. Sales come
+first, because the purchases are paid for with what the sales free up.
 
 The loop is defensive about its own failures: an exception inside a cycle is logged and the
-cycle is abandoned, never the loop. An engine that dies on a transient API error leaves real
-positions unmanaged, which is the worst outcome available to it.
+cycle is abandoned, never the loop. A failed order leaves the day undecided, and the whole
+decision runs again a few minutes later — it is safe to repeat, because it only ever moves
+the account towards what the closes say it should hold.
 """
 
 from __future__ import annotations
@@ -19,42 +21,70 @@ import logging
 import threading
 import time
 import traceback
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
-from . import doctrine, positions as position_rules
-from .analysis import regime as regime_module, setups
-from .analysis.scanner import Scanner
-from .brain.claude import Brain
+from . import doctrine, positions as books, strategy
 from .bus import bus
-from .models import Analysis, Candidate, Fill, Position, clean, new_id, now_ms
+from .models import Fill, Position, clean, new_id, now_ms
 from .notify.telegram import TelegramNotifier
-from .risk import AccountState, RiskEngine, utc_day_start, utc_week_start
+from .risk import AccountState, buy_blocks, utc_day_start
 from .store import Store
+from .strategy import Signal
 from .venues.base import VenueError
 from .venues.simulated import SimulatedBroker, SyntheticMarket
 
 log = logging.getLogger("helm.engine")
+
+DAY_MS = 86_400_000
+RETRY_MS = 5 * 60_000            # after a failed order, before the decision runs again
+GIVE_UP_MS = 3 * 3_600_000       # after the close, before deciding without a missing coin
+
+# The bot's command menu, registered with Telegram at start so it can never drift from
+# what the engine actually answers.
+COMMANDS = {
+    "status": "Equity, the four coins against their averages",
+    "positions": "Coins held, with their results so far",
+    "trades": "The last closed trades",
+    "pause": "Stop purchases; sales still happen",
+    "resume": "Let the rule buy again",
+    "flatten": "Sell everything and pause (needs /confirm)",
+    "kill": "Flatten and stop the engine (needs /confirm)",
+    "confirm": "Approve the last /flatten or /kill",
+    "help": "List these commands",
+}
+
+
+def _coin(symbol: str) -> str:
+    return symbol[: -len(doctrine.QUOTE)] if symbol.endswith(doctrine.QUOTE) else symbol
+
+
+def _day(ms: float) -> str:
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).date().isoformat()
 
 
 class Engine:
     def __init__(self, config) -> None:
         self.config = config
         self.store = Store(config.db_path)
-        self.risk = RiskEngine()
-        self.brain = Brain(config)
 
         self.market, self.broker, self.synthetic = self._build_venue()
-        self.scanner = Scanner(self.market, config)
 
         self.positions: list[Position] = []
         self.instruments: dict = {}
+        # The verdicts the last decision acted on, kept across restarts for the dashboard.
+        self.signals: dict[str, Signal] = {
+            row["symbol"]: Signal(row["symbol"], row["day"], row["close"], row["average"])
+            for row in (self.store.get("signals", []) or [])
+        }
 
         self._thread: threading.Thread | None = None
         self._stop_flag = threading.Event()
         self._cycle = 0
-        self._scan_rows: list[dict] = []
         self._prices: dict[str, float] = {}
-        self._analysis: dict[str, Analysis] = {}
+        self._retry_at = 0
+        # Failures already reported today, so a retry every few minutes does not page anyone
+        # every few minutes.
+        self._reported: set[str] = set()
 
         self.notifier = TelegramNotifier(
             config.telegram_token,
@@ -89,17 +119,11 @@ class Engine:
             market = SyntheticMarket(config.quote)
             return market, self._simulated_broker(market), True
 
-        real = None
         try:
-            if venue == "alpaca":
-                from .venues.alpaca import AlpacaVenue
+            from .venues.binance import BinanceVenue
 
-                real = AlpacaVenue(config)
-            else:
-                from .venues.binance import BinanceVenue
-
-                real = BinanceVenue(config)
-                real.sync_time()
+            real = BinanceVenue(config)
+            real.sync_time()
             real.instruments()  # proves the venue is actually reachable
         except Exception as exc:
             log.warning("venue %s unreachable (%s) — falling back to synthetic data", venue, exc)
@@ -127,28 +151,21 @@ class Engine:
 
     def _restore_positions(self) -> None:
         for row in self.store.load_open_positions():
-            state = row.get("state") or {}
             self.positions.append(
                 Position(
                     id=row["id"], symbol=row["symbol"], venue=row["venue"], qty=row["qty"],
-                    entry_price=row["entry_price"], stop=row["stop"], target=row["target"],
-                    initial_stop=row["initial_stop"], initial_qty=row["initial_qty"],
-                    risk_amount=row["risk_amount"], opened_at=row["opened_at"],
-                    setup=row["setup"], score=row["score"], conviction=row["conviction"],
-                    thesis=row["thesis"], invalidation=row["invalidation"],
-                    scaled_out=bool(state.get("scaled_out")),
-                    breakeven_set=bool(state.get("breakeven_set")),
-                    highest_close=float(state.get("highest_close") or row["entry_price"]),
-                    fees_paid=row["fees_paid"], realized_pnl=row["realized_pnl"],
-                    regime_break_closes=int(state.get("regime_break_closes") or 0),
-                    regime_bar_time=float(state.get("regime_bar_time") or 0.0),
-                    last_note=str(state.get("last_note") or ""),
+                    entry_price=row["entry_price"], initial_qty=row["initial_qty"],
+                    opened_at=row["opened_at"], cost=row["cost"],
+                    entry_close=row["entry_close"], entry_average=row["entry_average"],
+                    fees_paid=row["fees_paid"], entry_fee=row["entry_fee"],
+                    realized_pnl=row["realized_pnl"], last_note=row["last_note"],
                 )
             )
         if self.positions:
             self.narrate(
-                f"Resumed management of {len(self.positions)} open "
-                f"position{'s' if len(self.positions) > 1 else ''} from the last run.",
+                f"Resumed with {len(self.positions)} coin"
+                f"{'s' if len(self.positions) > 1 else ''} held from the last run: "
+                f"{', '.join(_coin(p.symbol) for p in self.positions)}.",
                 level="info",
             )
 
@@ -157,7 +174,7 @@ class Engine:
         if self._thread and self._thread.is_alive():
             return
         self._restore_positions()
-        self.notifier.start(self._telegram_handlers())
+        self.notifier.start(self._telegram_handlers(), menu=COMMANDS)
         self._stop_flag.clear()
         self._thread = threading.Thread(target=self._run, name="helm-engine", daemon=True)
         self._thread.start()
@@ -168,15 +185,16 @@ class Engine:
         if self._thread:
             self._thread.join(timeout=10)
 
-    def pause(self) -> None:
+    def pause(self, why: str = "Paused by hand.") -> None:
         self.paused = True
         self.store.put("paused", True)
-        self.narrate("Paused by hand. Open positions stay managed; no new entries.", level="warn")
+        self.narrate(f"{why} No purchases until resumed; a coin whose trend breaks is still sold.",
+                     level="warn")
 
     def resume(self) -> None:
         self.paused = False
         self.store.put("paused", False)
-        self.narrate("Resumed. Scanning again.", level="info")
+        self.narrate("Resumed. The rule buys again from the next daily close.", level="info")
 
     def _run(self) -> None:
         mode = "LIVE — real money" if self.config.live else "dry run — simulated fills"
@@ -222,25 +240,10 @@ class Engine:
 
         state = self.account_state()
         self.store.record_equity(
-            state.equity, state.cash,
-            sum(p.qty * self._price_of(p.symbol, p.entry_price) for p in self.positions),
-            state.realized_today, len(self.positions),
+            state.equity, state.cash, state.invested, state.realized_today, len(self.positions)
         )
-        self._check_drawdown_halt(state)
 
-        self.maybe_send_digest()
-
-        self.phase = "managing"
-        self.broadcast()
-        self.manage_positions()
-
-        # Counted from the first cycle rather than by remainder-equals-one: `n % 1 == 1`
-        # is false for every integer, so the obvious form silently disables scanning
-        # altogether when someone sets the interval to 1.
-        if (self._cycle - 1) % max(1, self.config.scan_every_cycles) == 0:
-            self.phase = "scanning"
-            self.broadcast()
-            self.hunt()
+        self.daily()
         self.phase = "waiting"
 
     # -- prices and reconciliation -------------------------------------------------------
@@ -293,40 +296,39 @@ class Engine:
                 position.qty = held
                 self.store.sync_position(position)
 
-    def _check_orphans(self, balances: dict[str, float]) -> None:
-        """Flag assets sitting in the account that the engine has no plan for.
-
-        This is the symptom of losing the database — most likely a redeploy onto ephemeral
-        storage. The holdings survive on the exchange, but every stop, target and thesis
-        that was managing them is gone, and an open position with no stop is the single
-        most dangerous state this system can be in.
-
-        It deliberately warns rather than adopting. The engine cannot know what an orphan
-        was bought for, and the account may legitimately hold coins it did not buy — a
-        long-term holding in the same account must not be sold by an engine that assumed
-        every balance was its own. Whoever reads the alert decides.
-        """
+    def _orphans(self, balances: dict[str, float]) -> list[tuple[str, float, float]]:
+        """Coins in the account worth selling that no open position accounts for."""
         known = {position.symbol for position in self.positions}
-        instruments = self._instrument_map()
-        if not instruments:
-            return
-
-        warned = set(self.store.get("orphans_warned", []) or [])
         found = []
-
-        for symbol, instrument in instruments.items():
+        for symbol, instrument in self._instrument_map().items():
             if symbol in known:
                 continue
             held = balances.get(instrument.base, 0.0)
             if held <= 0:
                 continue
-            price = self._price_of(symbol, 0.0)
-            value = held * price
+            value = held * self._price_of(symbol, 0.0)
             # Ignore dust: leftover fractions below the minimum order size cannot be sold
             # anyway, so reporting them is noise.
-            if value < self._dust_floor(symbol):
-                continue
-            found.append((symbol, held, value))
+            if value >= self._dust_floor(symbol):
+                found.append((symbol, held, value))
+        return found
+
+    def _check_orphans(self, balances: dict[str, float]) -> None:
+        """Flag coins sitting in the account that the engine has no record of buying.
+
+        This is the symptom of losing the database — most likely a redeploy onto ephemeral
+        storage. The holdings survive on the exchange, but the record of why they are there
+        is gone.
+
+        It deliberately warns rather than adopting. The account may legitimately hold coins
+        the engine did not buy, and an engine that assumed every balance was its own would
+        sell them. Whoever reads the alert decides. Until then the rule will not buy more of
+        a coin the account already holds this way: that would be adding to it.
+        """
+        if not self._instrument_map():
+            return
+        warned = set(self.store.get("orphans_warned", []) or [])
+        found = self._orphans(balances)
 
         for symbol, held, value in found:
             if symbol in warned:
@@ -334,9 +336,9 @@ class Engine:
             warned.add(symbol)
             self.narrate(
                 f"{symbol}: the account holds {held:.8f} (~{value:.2f} {self.config.quote}) "
-                f"that I have no record of. It has NO STOP and I am not managing it. "
-                f"If the database was lost on a redeploy, put it on a persistent volume. "
-                f"Sell it by hand, or use /flatten, if it should not be there.",
+                f"that I have no record of buying, and I am not managing it. If the database "
+                f"was lost on a redeploy, put it on a persistent volume. Sell it by hand, or "
+                f"use /flatten, if it should not be there.",
                 level="error",
             )
 
@@ -362,11 +364,12 @@ class Engine:
 
     # -- account -------------------------------------------------------------------------
     def account_state(self) -> AccountState:
+        synced = True
         try:
             balances = self.broker.balances()
         except Exception as exc:
             log.warning("balances unavailable: %s", exc)
-            balances = {}
+            balances, synced = {}, False
 
         cash = balances.get(self.config.quote, 0.0)
         holdings = 0.0
@@ -376,121 +379,298 @@ class Engine:
         if equity <= 0:
             equity = self.config.starting_equity
 
-        day_start = utc_day_start().timestamp() * 1000
-        week_start = utc_week_start().timestamp() * 1000
-
-        realized_today = self.store.realized_since(day_start)
-        realized_week = self.store.realized_since(week_start)
-
-        # Counts closed *and* still-open trades opened today: the daily cap is about how
-        # many times I pulled the trigger, not how many of them happen to be finished.
-        entries_today = self.store.entries_since(day_start)
-
-        streak = 0
-        for result in self.store.recent_results(20):
-            if result < 0:
-                streak += 1
-            else:
-                break
-
-        # The high-water mark advances on *realised* results only. Marking it to an open
-        # position's unrealised spike would let a winner that later gives back some profit
-        # register as a drawdown — and a big enough round trip would trip the hard halt
-        # without a single losing trade.
-        realized_equity = self.config.starting_equity + self.store.total_realized()
-        peak = max(
-            float(self.store.get("peak_equity", 0.0) or 0.0),
-            realized_equity,
-            self.config.starting_equity,
-        )
-        self.store.put("peak_equity", peak)
-
         return AccountState(
             equity=equity,
             cash=cash,
             positions=self.positions,
-            realized_today=realized_today,
-            realized_week=realized_week,
-            peak_equity=peak,
-            consecutive_losses=streak,
-            entries_today=entries_today,
-            cooldowns={k: int(v) for k, v in (self.store.get("cooldowns", {}) or {}).items()},
-            loss_cooldown_until=int(self.store.get("loss_cooldown_until", 0) or 0),
+            realized_today=self.store.realized_since(utc_day_start().timestamp() * 1000),
+            peak_equity=float(self.store.get("equity_peak", 0.0) or 0.0),
             halted=self.halted,
             halt_reason=self.halt_reason,
+            synced=synced,
         )
 
-    def _check_drawdown_halt(self, state: AccountState) -> None:
-        if self.halted or state.drawdown < doctrine.MAX_DRAWDOWN_HALT:
-            return
-        self.halt(
-            f"drawdown reached {state.drawdown*100:.1f}%, past the "
-            f"{doctrine.MAX_DRAWDOWN_HALT*100:.0f}% hard limit"
-        )
+    def _check_drawdown_halt(self, equity: float) -> None:
+        """Doctrine section 6, measured once a day on the equity the decision sees.
+
+        The peak is the highest equity any decision has seen — open positions marked to the
+        close, as the rule was tested. A drop that big means the market is doing something the
+        rule has never met or the engine is broken, and a human should look before it buys.
+        """
+        peak = max(float(self.store.get("equity_peak", 0.0) or 0.0), equity)
+        self.store.put("equity_peak", peak)
+        drawdown = 1 - equity / peak if peak > 0 else 0.0
+        if not self.halted and drawdown >= doctrine.MAX_DRAWDOWN_HALT:
+            self.halt(
+                f"equity is {drawdown*100:.1f}% below its peak of {peak:.2f}, past the "
+                f"{doctrine.MAX_DRAWDOWN_HALT*100:.0f}% hard limit"
+            )
 
     def halt(self, reason: str) -> None:
         self.halted = True
         self.halt_reason = reason
         self.store.put("halted", True)
         self.store.put("halt_reason", reason)
-        self.narrate(f"HALTED — {reason}. This needs a human to clear.", level="error")
+        self.narrate(
+            f"HALTED — {reason}. No purchases until a human clears it; sales still happen.",
+            level="error",
+        )
 
     def clear_halt(self) -> None:
+        """Clearing the halt is a human accepting the account as it now stands.
+
+        So the peak starts again from today's equity. Left where it was, the next decision
+        would measure the same drop against the same peak and halt again at once — a halt no
+        human could ever clear.
+        """
         self.halted = False
         self.halt_reason = ""
         self.store.put("halted", False)
         self.store.put("halt_reason", "")
-        self.narrate("Halt cleared by hand. Trading may resume.", level="warn")
+        self.store.put("equity_peak", self.account_state().equity)
+        self.narrate("Halt cleared by hand. The rule buys again from the next daily close.",
+                     level="warn")
 
-    # -- managing open positions ---------------------------------------------------------
-    def manage_positions(self) -> None:
-        for position in list(self.positions):
-            try:
-                self._manage_one(position)
-            except Exception as exc:
-                log.error("managing %s failed: %s", position.symbol, exc)
-                self.narrate(f"Could not manage {position.symbol}: {exc}", level="error")
+    # -- the daily decision --------------------------------------------------------------
+    def _last_close(self) -> int:
+        """Open time of the most recent daily candle that has closed."""
+        return int((utc_day_start() - timedelta(days=1)).timestamp() * 1000)
 
-    def _manage_one(self, position: Position) -> None:
-        price = self._price_of(position.symbol)
-        if price <= 0:
+    def daily(self) -> None:
+        """Run the day's decision, once, as soon as the day it rests on has closed."""
+        day = self._last_close()
+        if int(self.store.get("decided_day", 0) or 0) >= day or now_ms() < self._retry_at:
             return
 
-        analysis = self._analysis.get(position.symbol)
-        structure = None
+        signals, missing, unknown = self._read_signals(day)
+        if missing:
+            # Usually the exchange has not published the new candle yet, a few seconds after
+            # midnight. Try again next cycle, quietly — unless it has been hours.
+            if now_ms() - (day + DAY_MS) < GIVE_UP_MS:
+                log.info("waiting for the %s close: %s", _day(day), "; ".join(missing))
+                return
+            self._report_failure(
+                "close",
+                f"No {_day(day)} close for {', '.join(missing)} after "
+                f"{GIVE_UP_MS // 3_600_000} hours. Deciding without "
+                f"{'it' if len(missing) == 1 else 'them'}: a coin held stays held, and none "
+                f"is bought.",
+            )
+
+        self.phase = "deciding"
+        self.broadcast()
+        self.signals = {**self.signals, **signals}
+        self.store.put("signals", [signal.to_dict() for signal in self.signals.values()])
+
+        state = self.account_state()
+        if not state.synced:
+            # Deciding blind would size from no cash at all and skip the day's purchases.
+            self._report_failure("account", "Could not read the account for the daily decision. "
+                                            "Trying again shortly.")
+            self._retry_at = now_ms() + RETRY_MS
+            return
+        equity = state.equity                   # before any sale: the figure the rule was tested on
+        self._check_drawdown_halt(equity)
+
+        outcomes: dict[str, tuple[str, str, str | None]] = {}
+        failed = False
+
+        # Sales first: they pay for the purchases.
+        held = {position.symbol for position in self.positions}
+        for symbol in strategy.exits(signals, held):
+            position = next(p for p in self.positions if p.symbol == symbol)
+            done, note = self._sell(position, signals[symbol])
+            outcomes[symbol] = ("SELL" if done else "SELL_FAILED", note, position.id)
+            failed |= not done
+
         try:
-            structure = self.market.candles(position.symbol, doctrine.STRUCTURE_TF, 120)
-            if analysis is None:
-                trigger = self.market.candles(position.symbol, doctrine.TRIGGER_TF, 60)
-                regime_candles = self.market.candles(position.symbol, doctrine.REGIME_TF, 250)
-                regime, metrics = regime_module.classify(regime_candles)
-                analysis = setups.analyse(position.symbol, trigger, structure, regime, metrics)
-                self._analysis[position.symbol] = analysis
+            balances = self.broker.balances()
         except Exception as exc:
-            log.warning("analysis unavailable for %s: %s", position.symbol, exc)
-
-        position_rules.update_highest_close(position, structure, price)
-        if analysis is not None:
-            position_rules.count_regime_break(position, structure, analysis.indicators.get("ema21", 0.0))
-
-        result = position_rules.plan(position, price, analysis)
-
-        if result.stop_update is not None:
-            position.stop = result.stop_update.stop
-            if position.stop >= position.entry_price:
-                position.breakeven_set = True
-            position.last_note = result.stop_update.reason
-            self.store.sync_position(position)
-            self.narrate(f"{position.symbol}: {result.stop_update.reason}", level="info")
-
-        if result.exit is None:
-            if result.notes:
-                position.last_note = result.notes[0]
-                self.store.sync_position(position)
+            # Cash is unknown, so nothing can be sized. Record what was sold and come back.
+            log.warning("balances unavailable after the sales: %s", exc)
+            self._record(day, signals, outcomes)
+            self._retry_at = now_ms() + RETRY_MS
             return
+        state = self.account_state()
+        blocks = buy_blocks(state, self.paused)
+        held = {position.symbol for position in self.positions}
+        holding_already = {row[0] for row in self._orphans(balances)}
+        minimums = {symbol: self._dust_floor(symbol) for symbol in doctrine.SYMBOLS}
 
-        self._execute_exit(position, result.exit, price)
+        for entry in strategy.entries(signals, held, equity, balances.get(self.config.quote, 0.0), minimums):
+            signal = signals[entry.symbol]
+            if blocks:
+                outcomes[entry.symbol] = ("STAY_OUT", f"Above its average, but not buying: {blocks[0]}.", None)
+            elif entry.symbol in holding_already:
+                outcomes[entry.symbol] = (
+                    "STAY_OUT",
+                    f"Above its average, but the account already holds {_coin(entry.symbol)} "
+                    f"I have no record of. Buying more would be adding to it.",
+                    None,
+                )
+            elif entry.skipped:
+                outcomes[entry.symbol] = ("STAY_OUT", f"Above its average, but {entry.skipped}.", None)
+            else:
+                position_id, note = self._buy(entry, signal)
+                outcomes[entry.symbol] = ("BUY" if position_id else "BUY_FAILED", note, position_id)
+                failed |= position_id is None
 
+        self._record(day, signals, outcomes)
+
+        if failed:
+            self._retry_at = now_ms() + RETRY_MS
+            return
+        self.store.put("decided_day", day)
+        self._reported.clear()
+        self._daily_report(day, signals, unknown, outcomes)
+
+    def _read_signals(self, day: int) -> tuple[dict[str, Signal], list[str], list[str]]:
+        """Verdicts for the closed day. Returns (signals, missing, unknown).
+
+        Missing coins have no candle for that day yet, or the fetch failed: worth waiting for.
+        Unknown coins have fewer closed days than the average needs: nothing to wait for, and
+        no verdict to act on.
+        """
+        signals: dict[str, Signal] = {}
+        missing: list[str] = []
+        unknown: list[str] = []
+        for symbol in doctrine.SYMBOLS:
+            try:
+                # A few spare: a live feed drops the still-forming candle from what it returns.
+                candles = self.market.candles(symbol, doctrine.TREND_TF, doctrine.SMA_DAYS + 5)
+            except Exception as exc:
+                missing.append(f"{symbol} ({exc})")
+                continue
+            signal = strategy.read(candles)
+            if signal is None:
+                unknown.append(symbol)
+            elif signal.day < day:
+                missing.append(symbol)
+            else:
+                signals[symbol] = signal
+        return signals, missing, unknown
+
+    def _sell(self, position: Position, signal: Signal) -> tuple[bool, str]:
+        """Sell a coin whose trend has broken. Returns (sold in full, what happened)."""
+        self.phase = "executing"
+        self.broadcast()
+        why = (f"closed at {signal.close:,.6g}, {-signal.distance*100:.1f}% below its "
+               f"{doctrine.SMA_DAYS}-day average of {signal.average:,.6g}")
+        try:
+            fill, net, closed = self._sell_out(position, 1.0)
+        except VenueError as exc:
+            self._report_failure(position.symbol, f"Could not sell {position.symbol}: {exc}. Trying again shortly.")
+            return False, f"Sale rejected: {exc}"
+
+        self.store.save_fill(new_id("fill"), position.id, fill, "TREND_OFF")
+        if not closed:
+            position.last_note = f"Trend broke; sold {fill.qty:.8f}, {position.qty:.8f} still to sell."
+            self.store.sync_position(position)
+            self._report_failure(position.symbol, f"{position.symbol}: the sale filled short — "
+                                                  f"{position.qty:.8f} still held. Selling the rest shortly.")
+            return False, position.last_note
+        self._finalise(position, fill.price, "TREND_OFF", reason_text=f"it {why}.", net=net)
+        return True, f"Sold: it {why}."
+
+    def _buy(self, entry: strategy.Entry, signal: Signal) -> tuple[str | None, str]:
+        """Buy a coin whose trend has turned on. Returns (position id or None, what happened)."""
+        self.phase = "executing"
+        self.broadcast()
+        why = (f"closed at {signal.close:,.6g}, {signal.distance*100:.1f}% above its "
+               f"{doctrine.SMA_DAYS}-day average of {signal.average:,.6g}")
+        try:
+            fill = self.broker.buy(entry.symbol, entry.amount)
+        except VenueError as exc:
+            self._report_failure(entry.symbol, f"Could not buy {entry.symbol}: {exc}. Trying again shortly.")
+            return None, f"Purchase rejected: {exc}"
+        if fill.qty <= 0:
+            self._report_failure(entry.symbol, f"{entry.symbol}: the order returned no fill.")
+            return None, "The order returned no fill."
+
+        position = Position(
+            id=new_id("pos"), symbol=entry.symbol, venue=self.broker.name, qty=fill.qty,
+            entry_price=fill.price, initial_qty=fill.qty, opened_at=now_ms(),
+            cost=fill.qty * fill.price + fill.fee, entry_close=signal.close,
+            entry_average=signal.average, fees_paid=fill.fee, entry_fee=fill.fee,
+            last_note=f"Bought: it {why}.",
+        )
+        self.positions.append(position)
+        self.store.open_position(position)
+        self.store.save_fill(new_id("fill"), position.id, fill, "TREND_ON")
+        self._persist_sim_balances()
+
+        self.narrate(
+            f"Bought {entry.symbol} — {position.cost:.2f} {self.config.quote} at "
+            f"{fill.price:,.6g}. It {why}. Held until a daily close below the average.",
+            level="entry",
+        )
+        bus.publish("position_opened", position.to_dict(fill.price))
+        return position.id, position.last_note
+
+    def _report_failure(self, key: str, message: str) -> None:
+        """Narrate a failure once a day; retries after that only reach the log."""
+        if key in self._reported:
+            log.warning("%s", message)
+            return
+        self._reported.add(key)
+        self.narrate(message, level="error")
+
+    def _record(self, day: int, signals: dict[str, Signal], outcomes: dict) -> None:
+        for symbol, signal in signals.items():
+            held = any(position.symbol == symbol for position in self.positions)
+            if held:
+                default = ("HOLD", "Above its average, and held." if signal.on else
+                           "Below its average; the sale waits for the decision to run again.", None)
+            else:
+                default = ("STAY_OUT", "Below its average, and in cash." if not signal.on else
+                           "Above its average; the purchase waits for the decision to run again.", None)
+            action, note, position_id = outcomes.get(symbol, default)
+            self.store.save_decision({
+                "id": new_id("dec"), "ts": now_ms(), "day": day, "symbol": symbol,
+                "close": signal.close, "average": signal.average, "distance": signal.distance,
+                "on": signal.on, "action": action, "note": note, "position_id": position_id,
+            })
+        bus.publish("decision", {"day": day})
+
+    def _daily_report(self, day: int, signals: dict[str, Signal], unknown: list[str], outcomes: dict) -> None:
+        """One message a day, whether or not anything happened.
+
+        A system that only speaks up when it trades is indistinguishable from one that has
+        quietly died, and with this rule most days are correctly uneventful.
+        """
+        state = self.account_state()
+        quote = self.config.quote
+        lines = [f"Daily close — {_day(day)}", ""]
+        for symbol in doctrine.SYMBOLS:
+            signal = signals.get(symbol)
+            if signal is None:
+                lines.append(f"{_coin(symbol):4} no verdict"
+                             + (f" (fewer than {doctrine.SMA_DAYS} days)" if symbol in unknown else ""))
+                continue
+            action = outcomes.get(symbol, ("", "", None))[0]
+            held = any(position.symbol == symbol for position in self.positions)
+            doing = {"BUY": "bought", "SELL": "sold"}.get(
+                action, "held" if held else ("not bought" if signal.on else "in cash"))
+            lines.append(f"{_coin(symbol):4} {'above' if signal.on else 'below'} average "
+                         f"{signal.distance*100:+.1f}% · {doing}")
+        lines += [
+            "",
+            f"Equity {state.equity:.2f} {quote} "
+            f"({(state.equity / self.config.starting_equity - 1) * 100:+.1f}% overall)",
+            f"Invested {state.invested:.2f} · cash {state.cash:.2f} · "
+            f"drawdown {state.drawdown*100:.1f}% (halt at {doctrine.MAX_DRAWDOWN_HALT*100:.0f}%)",
+        ]
+        blocks = buy_blocks(state, self.paused)
+        if blocks:
+            lines += ["", f"Not buying: {blocks[0]}"]
+        # Straight to the notifier rather than through narrate(): the report is a message to
+        # you, not an event in the engine's own story.
+        self.notifier.notify("\n".join(lines), "warn" if blocks else "entry")
+        self.narrate(f"Read the {_day(day)} close. " + "; ".join(
+            f"{_coin(s)} {'above' if sig.on else 'below'} ({sig.distance*100:+.1f}%)"
+            for s, sig in signals.items()) + ".", level="info")
+
+    # -- selling -------------------------------------------------------------------------
     def _sell_out(self, position: Position, fraction: float) -> tuple[Fill, float, bool]:
         """Sell `fraction` of a position and book it. Returns (fill, net, books closed).
 
@@ -498,7 +678,7 @@ class Engine:
         the same coin — only an amount too small to sell on its own, so a holding the engine
         did not buy is never touched. And it writes off whatever still cannot be sold, so
         the booked result matches the cash. A remainder too big to be dust is a short fill,
-        not a sliver: the position stays open and the next cycle sells the rest.
+        not a sliver: the position stays open and the decision sells the rest on its retry.
         """
         final = fraction >= 1.0
         qty = position.qty * fraction
@@ -514,7 +694,7 @@ class Engine:
                 qty += extra
             if held > 0:
                 # Never ask for more than the account holds: the exchange rejects the whole
-                # order, and a rejected exit is a stop that never fires.
+                # order, and a rejected exit is a sale that never happens.
                 qty = min(qty, held)
         instrument = self._instrument_map().get(position.symbol)
         if instrument is not None:
@@ -525,253 +705,44 @@ class Engine:
         fill = self.broker.sell(position.symbol, qty)
         own = min(fill.qty, position.qty)
         own_fee = fill.fee * (own / fill.qty) if fill.qty > 0 else fill.fee
-        net = position_rules.realise(position, own, fill.price, own_fee)
+        net = books.realise(position, own, fill.price, own_fee)
         if fill.qty > own:
-            net += position_rules.book_swept(position, fill.qty - own, fill.price, fill.fee - own_fee)
+            net += books.book_swept(position, fill.qty - own, fill.price, fill.fee - own_fee)
 
         if not final or position.qty * price >= self._dust_floor(position.symbol):
             return fill, net, False
-        net += position_rules.write_off(position)
+        net += books.write_off(position)
         return fill, net, True
 
-    def _execute_exit(self, position: Position, exit_plan, price: float) -> None:
-        self.phase = "executing"
-        self.broadcast()
-        try:
-            fill, net, closed = self._sell_out(position, exit_plan.fraction)
-        except VenueError as exc:
-            self.narrate(f"Exit order for {position.symbol} was rejected: {exc}", level="error")
-            return
-
-        self.store.save_fill(new_id("fill"), position.id, fill, exit_plan.kind)
-
-        if exit_plan.kind == "SCALE_OUT":
-            position.scaled_out = True
-            position.last_note = exit_plan.reason
-            self.store.sync_position(position)
-            self.narrate(
-                f"{position.symbol}: {exit_plan.reason} Booked {net:+.2f} {self.config.quote}.",
-                level="win" if net > 0 else "info",
-            )
-            bus.publish("position_update", position.to_dict(price))
-            return
-
-        if not closed:
-            position.last_note = f"{exit_plan.reason} Filled short; selling the rest next cycle."
-            self.store.sync_position(position)
-            self.narrate(
-                f"{position.symbol}: exit filled short — {position.qty:.8f} still held. "
-                f"Selling the rest next cycle.",
-                level="warn",
-            )
-            return
-
-        self._finalise(position, fill.price, exit_plan.kind, reason_text=exit_plan.reason, net=net)
-
     def _finalise(self, position: Position, price: float, kind: str, reason_text: str = "", net: float | None = None) -> None:
-        """Close out the engine's record of a position and update the streak counters."""
+        """Close out the engine's record of a position."""
         if net is None and position.qty > 0:
-            net = position_rules.realise(position, position.qty, price, 0.0)
+            books.realise(position, position.qty, price, 0.0)
         position.qty = 0.0
+        if reason_text:
+            position.last_note = reason_text
 
-        r_multiple = position.realized_pnl / position.risk_amount if position.risk_amount else 0.0
-        self.store.close_position(position, price, kind, r_multiple)
+        self.store.close_position(position, price, kind)
         if position in self.positions:
             self.positions.remove(position)
-        self._analysis.pop(position.symbol, None)
-
-        won = position.realized_pnl > 0
-        if kind in {"STOP", "CATASTROPHE"} or not won:
-            cooldowns = self.store.get("cooldowns", {}) or {}
-            cooldowns[position.symbol] = now_ms() + doctrine.SYMBOL_COOLDOWN_HOURS * 3_600_000
-            self.store.put("cooldowns", cooldowns)
-
-        state = self.account_state()
-        if state.consecutive_losses >= doctrine.CONSECUTIVE_LOSS_LIMIT:
-            until = now_ms() + doctrine.CONSECUTIVE_LOSS_COOLDOWN_HOURS * 3_600_000
-            self.store.put("loss_cooldown_until", until)
-            self.narrate(
-                f"{state.consecutive_losses} losses in a row. Standing down for "
-                f"{doctrine.CONSECUTIVE_LOSS_COOLDOWN_HOURS}h — the regime has probably changed.",
-                level="warn",
-            )
-
         self._persist_sim_balances()
-        summary = reason_text or kind.replace("_", " ").lower()
+
+        pct = position.realized_pnl / position.cost * 100 if position.cost else 0.0
+        summary = reason_text or kind.replace("_", " ").lower() + "."
         self.narrate(
-            f"Closed {position.symbol} — {summary} "
-            f"Result {position.realized_pnl:+.2f} {self.config.quote} ({r_multiple:+.2f}R).",
-            level="win" if won else "loss",
+            f"Sold {position.symbol} — {summary} "
+            f"Result {position.realized_pnl:+.2f} {self.config.quote} ({pct:+.1f}%).",
+            level="win" if position.realized_pnl > 0 else "loss",
         )
         bus.publish("position_closed", {"symbol": position.symbol, "pnl": position.realized_pnl})
 
-    # -- hunting -------------------------------------------------------------------------
-    def hunt(self) -> None:
-        try:
-            candidates, rows = self.scanner.scan()
-        except Exception as exc:
-            self.narrate(f"Scan failed: {exc}", level="error")
-            return
-
-        self._scan_rows = rows
-        for candidate in candidates:
-            self._analysis[candidate.symbol] = candidate.analysis
-        bus.publish("scan", rows)
-
-        state = self.account_state()
-        blocks = self.risk.gate_entries(state, now_ms())
-
-        if self.paused:
-            blocks = ["paused by hand"] + blocks
-
-        if blocks:
-            self.narrate(
-                f"Looked at {len(rows)} markets. Not taking anything: {blocks[0]}.",
-                level="info",
-            )
-            return
-
-        if not candidates:
-            tradeable = sum(1 for row in rows if row["tradeable"])
-            self.narrate(
-                f"Looked at {len(rows)} markets, {tradeable} in a regime worth trading. "
-                f"Nothing met the bar. Holding cash.",
-                level="info",
-            )
-            return
-
-        for candidate in candidates[:2]:   # at most two judgements per scan, for cost
-            if self._consider(candidate, state):
-                break
-
-    def _consider(self, candidate: Candidate, state: AccountState) -> bool:
-        """Run one candidate through the rails, the decision layer, then the rails again."""
-        instrument = self._instrument_map().get(candidate.symbol)
-        pre = self.risk.evaluate(candidate, state, now_ms(), instrument=instrument)
-
-        if not pre.allowed:
-            self.narrate(
-                f"{candidate.symbol} scored {candidate.score:.0f} on a {_label(candidate.setup)} "
-                f"but the rules say no: {pre.reasons[0]}",
-                level="info",
-            )
-            self._record_decision(candidate, None, pre, blocked_by=pre.reasons[0])
-            return False
-
-        if not self.brain.should_ask(candidate):
-            return False
-
-        self.phase = "deciding"
-        self.broadcast()
-        self.narrate(
-            f"{candidate.symbol} — {_label(candidate.setup)} scoring {candidate.score:.0f}. "
-            f"Thinking it over.",
-            level="think",
-        )
-
-        verdict = self.brain.judge_entry(
-            candidate, state, self.store.closed_positions(8), self._scan_rows
-        )
-
-        if not verdict.go:
-            self.narrate(
-                f"Passing on {candidate.symbol}. {verdict.thesis or verdict.invalidation}",
-                level="pass",
-            )
-            self._record_decision(candidate, verdict, pre, blocked_by="declined")
-            return False
-
-        final = self.risk.evaluate(
-            candidate, state, now_ms(),
-            size_multiplier=verdict.size_multiplier,
-            stop_override=verdict.stop_override,
-            instrument=instrument,
-        )
-        if not final.allowed or final.sizing is None:
-            reason = final.reasons[0] if final.reasons else "sizing failed"
-            self.narrate(f"Wanted {candidate.symbol} but the rules blocked it: {reason}", level="warn")
-            self._record_decision(candidate, verdict, final, blocked_by=reason)
-            return False
-
-        return self._enter(candidate, verdict, final)
-
-    def _enter(self, candidate: Candidate, verdict, risk_verdict) -> bool:
-        sizing = risk_verdict.sizing
-        self.phase = "executing"
-        self.broadcast()
-        self.narrate(
-            f"Buying {candidate.symbol} — {sizing.quote_amount:.2f} {self.config.quote}, "
-            f"risking {sizing.risk_amount:.2f}. {verdict.thesis}",
-            level="entry",
-        )
-
-        try:
-            fill = self.broker.buy(candidate.symbol, sizing.quote_amount)
-        except VenueError as exc:
-            self.narrate(f"Entry for {candidate.symbol} was rejected: {exc}", level="error")
-            self._record_decision(candidate, verdict, risk_verdict, blocked_by=f"order rejected: {exc}")
-            return False
-
-        if fill.qty <= 0:
-            self.narrate(f"{candidate.symbol} order returned no fill. Standing down.", level="error")
-            return False
-
-        # Risk is recomputed from the *actual* fill, not the intended one. Slippage between
-        # the two is small but it is real, and the recorded risk should be the true one.
-        stop = sizing.stop
-        actual_risk = (fill.price - stop) * fill.qty
-
-        position = Position(
-            id=new_id("pos"), symbol=candidate.symbol, venue=self.broker.name, qty=fill.qty,
-            entry_price=fill.price, stop=stop, target=candidate.target, initial_stop=stop,
-            initial_qty=fill.qty, risk_amount=max(actual_risk, 0.01), opened_at=now_ms(),
-            setup=candidate.setup, score=candidate.score, conviction=verdict.conviction,
-            thesis=verdict.thesis, invalidation=verdict.invalidation,
-            highest_close=fill.price, fees_paid=fill.fee, entry_fee=fill.fee,
-        )
-        self.positions.append(position)
-        self.store.open_position(position)
-        self.store.save_fill(new_id("fill"), position.id, fill, "ENTRY")
-        self._record_decision(candidate, verdict, risk_verdict, position_id=position.id)
-        self._persist_sim_balances()
-
-        self.narrate(
-            f"In {candidate.symbol} at {fill.price:.6f}. Stop {stop:.6f} "
-            f"({sizing.stop_distance*100:.1f}% away), target {candidate.target:.6f}. "
-            f"Worst case from here is {sizing.risk_amount:.2f} {self.config.quote}.",
-            level="entry",
-        )
-        bus.publish("position_opened", position.to_dict(fill.price))
-        return True
-
-    def _record_decision(self, candidate, verdict, risk_verdict, blocked_by: str = "", position_id: str | None = None) -> None:
-        self.store.save_decision(
-            {
-                "id": new_id("dec"),
-                "ts": now_ms(),
-                "symbol": candidate.symbol,
-                "setup": candidate.setup,
-                "score": candidate.score,
-                "go": bool(verdict and verdict.go and not blocked_by),
-                "conviction": verdict.conviction if verdict else 0,
-                "size_multiplier": verdict.size_multiplier if verdict else 0.0,
-                "source": verdict.source if verdict else "rules",
-                "thesis": verdict.thesis if verdict else "",
-                "invalidation": verdict.invalidation if verdict else "",
-                "blocked_by": blocked_by,
-                "candidate": candidate.to_dict(),
-                "verdict": {
-                    **(verdict.to_dict() if verdict else {}),
-                    "risk": risk_verdict.to_dict() if risk_verdict else {},
-                },
-                "position_id": position_id,
-            }
-        )
-        bus.publish("decision", {"symbol": candidate.symbol, "go": bool(position_id)})
-
     # -- manual controls -----------------------------------------------------------------
     def flatten(self, reason: str = "manual") -> int:
-        """Sell everything at market, now. The one operation that must always work."""
+        """Sell everything at market, now, and pause. The one operation that must always work.
+
+        Pausing is part of it: without that, the rule would buy straight back in at the
+        next daily close whatever was still above its average.
+        """
         closed = 0
         for position in list(self.positions):
             try:
@@ -788,6 +759,8 @@ class Engine:
             closed += 1
         if closed:
             self.narrate(f"Flattened {closed} position(s) — {reason}.", level="warn")
+        if not self.paused:
+            self.pause("Paused after flattening, so the rule does not buy straight back in.")
         return closed
 
     def close_one(self, position_id: str) -> bool:
@@ -804,7 +777,11 @@ class Engine:
                 self.store.sync_position(position)
                 self.narrate(f"{position.symbol} filled short — {position.qty:.8f} still held.", level="error")
                 return False
-            self._finalise(position, fill.price, "MANUAL", reason_text="closed by hand.", net=net)
+            self._finalise(
+                position, fill.price, "MANUAL", net=net,
+                reason_text="closed by hand. The rule buys it back at the next daily close if "
+                            "it is still above its average — pause to stop that.",
+            )
             return True
         return False
 
@@ -812,139 +789,110 @@ class Engine:
         if isinstance(self.broker, SimulatedBroker):
             self.store.put("sim_balances", self.broker.snapshot())
 
-    def maybe_send_digest(self) -> None:
-        """One summary per UTC day, covering the day that just ended.
+    def next_decision_at(self) -> int:
+        return int((utc_day_start() + timedelta(days=1)).timestamp() * 1000)
 
-        Sent even when nothing happened. A system that only speaks up when it trades is
-        indistinguishable from a system that has quietly died, and at this account size
-        most days are correctly uneventful.
-        """
-        today = utc_day_start().date().isoformat()
-        if self.store.get("last_digest_day") == today:
-            return
-        first_run = self.store.get("last_digest_day") is None
-        self.store.put("last_digest_day", today)
-        if first_run:
-            return      # nothing meaningful to summarise on the very first boot
+    def _until_next(self) -> str:
+        if int(self.store.get("decided_day", 0) or 0) < self._last_close():
+            return "due now"
+        minutes = max(0, (self.next_decision_at() - now_ms()) // 60_000)
+        return f"in {minutes // 60}h {minutes % 60:02d}m"
 
-        yesterday_start = (utc_day_start() - timedelta(days=1)).timestamp() * 1000
-        today_start = utc_day_start().timestamp() * 1000
-        rows = [
-            row for row in self.store.closed_positions(100)
-            if yesterday_start <= (row.get("closed_at") or 0) < today_start
-        ]
-
-        state = self.account_state()
-        quote = self.config.quote
-        realized = sum(row.get("realized_pnl") or 0.0 for row in rows)
-        wins = sum(1 for row in rows if (row.get("realized_pnl") or 0.0) > 0)
-
-        lines = [
-            f"Daily summary — {(utc_day_start() - timedelta(days=1)).date().isoformat()}",
-            "",
-            f"Equity     {state.equity:.2f} {quote} "
-            f"({(state.equity / self.config.starting_equity - 1) * 100:+.1f}% overall)",
-            f"Yesterday  {realized:+.2f} {quote} over {len(rows)} trade(s)"
-            + (f", {wins} winner(s)" if rows else ""),
-            f"Open now   {len(self.positions)}  ·  drawdown {state.drawdown * 100:.1f}%",
-        ]
-        if rows:
-            lines.append("")
-            lines += [
-                f"  {row['symbol']} {row.get('realized_pnl') or 0:+.2f} "
-                f"({row.get('r_multiple') or 0:+.2f}R) {(row.get('exit_reason') or '').lower()}"
-                for row in rows
-            ]
-        else:
-            lines.append("")
-            lines.append("No trades. Nothing met the bar — that is the common case.")
-
-        blocks = self.risk.gate_entries(state, now_ms())
-        if blocks:
-            lines.append("")
-            lines.append(f"Currently blocked: {blocks[0]}")
-
-        # Routed straight to the notifier rather than through narrate(): the digest is a
-        # report to you, not an event in the engine's own story.
-        self.notifier.notify("\n".join(lines), "warn" if blocks else "entry")
+    def coins(self) -> list[dict]:
+        """Each coin against its average: the last decision's verdict, and where it is now."""
+        rows = []
+        for symbol in doctrine.SYMBOLS:
+            signal = self.signals.get(symbol)
+            price = self._price_of(symbol)
+            rows.append({
+                "symbol": symbol,
+                "price": price,
+                "held": any(position.symbol == symbol for position in self.positions),
+                **(signal.to_dict() if signal else {"day": None, "close": None, "average": None,
+                                                    "distance": None, "on": None}),
+                "now_distance": price / signal.average - 1 if signal and signal.average and price else None,
+            })
+        return rows
 
     # -- telegram ------------------------------------------------------------------------
     def _telegram_handlers(self) -> dict:
         """Commands the bot will answer.
 
-        Read-only queries run immediately. The two that cost money — flatten and kill —
-        arm a confirmation instead, because a fat-thumbed tap on a phone should not be able
-        to close three positions. Note what is deliberately absent: there is no command to
-        open a position or relax a limit. The bot can stop this system; it cannot aim it.
+        Read-only queries run immediately. The two that sell — flatten and kill — arm a
+        confirmation instead, because a fat-thumbed tap on a phone should not be able to
+        empty the account. Note what is deliberately absent: there is no command to buy or
+        to relax a limit. The bot can stop this system; it cannot aim it.
         """
 
         def status() -> str:
             state = self.account_state()
-            blocks = self.risk.gate_entries(state, now_ms())
-            if self.paused:
-                blocks = ["paused by hand"] + blocks
+            blocks = buy_blocks(state, self.paused)
             quote = self.config.quote
             lines = [
                 f"<b>{'LIVE' if self.config.live else 'DRY RUN'}</b>"
                 + ("  ⚠️ HALTED" if self.halted else ""),
                 f"Equity   {state.equity:.2f} {quote}"
                 f"  ({(state.equity / self.config.starting_equity - 1) * 100:+.1f}%)",
-                f"Today    {state.realized_today:+.2f} {quote}"
-                f"   ·  {state.entries_today}/{doctrine.MAX_ENTRIES_PER_DAY} entries",
-                f"Open     {len(self.positions)}/{doctrine.MAX_OPEN_POSITIONS}"
-                f"   ·  heat {state.open_risk:.2f} {quote}",
-                f"Drawdown {state.drawdown * 100:.1f}%",
-                f"Doing    {self.phase}  (cycle {self._cycle})",
+                f"Invested {state.invested:.2f} · cash {state.cash:.2f}",
+                f"Drawdown {state.drawdown * 100:.1f}%  (halt at {doctrine.MAX_DRAWDOWN_HALT*100:.0f}%)",
+                f"Next decision {self._until_next()} (00:00 UTC)",
+                "",
             ]
+            for row in self.coins():
+                if row["on"] is None:
+                    lines.append(f"{_coin(row['symbol']):4} no verdict yet")
+                    continue
+                lines.append(
+                    f"{_coin(row['symbol']):4} {'above' if row['on'] else 'below'} "
+                    f"{row['distance'] * 100:+.1f}% at the close"
+                    + (f", {row['now_distance'] * 100:+.1f}% now" if row["now_distance"] is not None else "")
+                    + (" · held" if row["held"] else "")
+                )
             if self.synthetic:
-                lines.append("⚠️ generated prices — not a real market")
+                lines.append("\n⚠️ generated prices — not a real market")
             lines.append("")
-            lines.append("Clear to trade." if not blocks else "Not trading: " + blocks[0])
+            lines.append("Following the rule." if not blocks else "Not buying: " + blocks[0])
             return "\n".join(lines)
 
         def positions() -> str:
             if not self.positions:
-                return "Flat — no money at risk."
+                return "Nothing held — all cash."
             quote = self.config.quote
             out = []
             for position in self.positions:
                 price = self._price_of(position.symbol, position.entry_price)
+                row = position.to_dict(price)
+                signal = self.signals.get(position.symbol)
                 out.append(
-                    f"<b>{position.symbol}</b>  {position.unrealized(price):+.2f} {quote}"
-                    f"  ({position.r_multiple(price):+.2f}R)\n"
-                    f"  entry {position.entry_price:.6f}  now {price:.6f}\n"
-                    f"  stop {position.stop:.6f}  target {position.target:.6f}\n"
-                    f"  {'half banked' if position.scaled_out else 'full size'}"
-                    f"  ·  held {(now_ms() - position.opened_at) / 3_600_000:.1f}h"
+                    f"<b>{position.symbol}</b>  {row['unrealized']:+.2f} {quote}"
+                    f"  ({row['unrealized_pct']:+.1f}%)\n"
+                    f"  bought {position.entry_price:,.6g}  now {price:,.6g}\n"
+                    + (f"  average {signal.average:,.6g} — sold on a close below it\n" if signal else "")
+                    + f"  held {(now_ms() - position.opened_at) / DAY_MS:.0f} days"
                 )
             return "\n\n".join(out)
 
-        def today() -> str:
-            day_start = utc_day_start().timestamp() * 1000
-            rows = [
-                row for row in self.store.closed_positions(50)
-                if (row.get("closed_at") or 0) >= day_start
-            ]
+        def trades() -> str:
+            rows = self.store.closed_positions(5)
             if not rows:
-                return "No trades closed today."
+                return "No closed trades yet."
             quote = self.config.quote
-            total = sum(row.get("realized_pnl") or 0.0 for row in rows)
-            lines = [
-                f"{row['symbol']}  {row.get('realized_pnl') or 0:+.2f} {quote}"
-                f"  ({row.get('r_multiple') or 0:+.2f}R)  {(row.get('exit_reason') or '').lower()}"
+            return "\n".join(
+                f"{_day(row['closed_at'] or 0)}  {row['symbol']}  "
+                f"{row.get('realized_pnl') or 0:+.2f} {quote} ({row.get('return_pct') or 0:+.1f}%)"
+                f"  {(row.get('exit_reason') or '').replace('_', ' ').lower()}"
                 for row in rows
-            ]
-            return "\n".join(lines) + f"\n\n<b>Total {total:+.2f} {quote}</b> over {len(rows)} trades"
+            )
 
         def pause() -> str:
-            self.pause()
-            return "Paused. Open positions stay managed; no new entries. /resume to restart."
+            self.pause("Paused from Telegram.")
+            return "Paused. No purchases; a coin whose trend breaks is still sold. /resume to undo."
 
         def resume() -> str:
             if self.halted:
                 return f"Still halted: {self.halt_reason}\nClear it from the dashboard first."
             self.resume()
-            return "Resumed — scanning again."
+            return "Resumed — the rule buys again from the next daily close."
 
         def arm(action: str, prompt: str) -> str:
             self._pending_command = (action, now_ms() + 120_000)
@@ -952,10 +900,11 @@ class Engine:
 
         def flatten() -> str:
             if not self.positions:
-                return "Nothing to flatten — no open positions."
+                return "Nothing to flatten — nothing held."
             return arm(
                 "flatten",
-                f"This sells all {len(self.positions)} position(s) at market, now.",
+                f"This sells all {len(self.positions)} coin(s) at market, now, and pauses "
+                f"purchases until you /resume.",
             )
 
         def kill() -> str:
@@ -975,7 +924,7 @@ class Engine:
                 return "That confirmation expired. Send the command again."
             if action == "flatten":
                 closed = self.flatten("confirmed from telegram")
-                return f"Flattened {closed} position(s)."
+                return f"Flattened {closed} position(s). Paused — /resume to let the rule buy again."
             if action == "kill":
                 closed = self.flatten("kill switch from telegram")
                 self.halt("kill switch used from Telegram")
@@ -984,20 +933,12 @@ class Engine:
             return "Unknown pending action."
 
         def help_text() -> str:
-            return (
-                "<b>Helm</b>\n"
-                "/status — equity, risk, what I'm doing\n"
-                "/positions — open trades in detail\n"
-                "/today — trades closed today\n"
-                "/pause — stop new entries, keep managing\n"
-                "/resume — start scanning again\n"
-                "/flatten — sell everything (needs /confirm)\n"
-                "/kill — flatten and stop the engine (needs /confirm)\n"
-                "/confirm — approve the last destructive command"
+            return "<b>Helm</b>\n" + "\n".join(
+                f"/{name} — {description}" for name, description in COMMANDS.items()
             )
 
         return {
-            "status": status, "positions": positions, "today": today,
+            "status": status, "positions": positions, "trades": trades,
             "pause": pause, "resume": resume, "flatten": flatten,
             "kill": kill, "confirm": confirm, "help": help_text, "start": help_text,
         }
@@ -1006,9 +947,9 @@ class Engine:
     def narrate(self, message: str, level: str = "info") -> None:
         """Say what is happening, in plain language.
 
-        This is the primary interface. A trading system you cannot follow in real time is
-        one you will eventually turn off out of unease, so the narration is a feature and
-        not logging decoration.
+        This is the primary interface. A trading system you cannot follow is one you will
+        eventually turn off out of unease, so the narration is a feature and not logging
+        decoration.
         """
         log.info("%s", message)
         # The stored row and the live event share one timestamp. They are the same line
@@ -1023,10 +964,6 @@ class Engine:
 
     def snapshot(self) -> dict:
         state = self.account_state()
-        blocks = self.risk.gate_entries(state, now_ms())
-        if self.paused:
-            blocks = ["paused by hand"] + blocks
-
         return clean(
             {
                 "phase": self.phase,
@@ -1043,36 +980,25 @@ class Engine:
                 "account": {
                     "equity": state.equity,
                     "cash": state.cash,
+                    "invested": state.invested,
                     "starting_equity": self.config.starting_equity,
                     "quote": self.config.quote,
                     "realized_today": state.realized_today,
-                    "realized_week": state.realized_week,
                     "peak_equity": state.peak_equity,
                     "drawdown": state.drawdown,
-                    "open_risk": state.open_risk,
-                    "heat_limit": doctrine.MAX_PORTFOLIO_HEAT * state.equity,
-                    "entries_today": state.entries_today,
-                    "consecutive_losses": state.consecutive_losses,
                     "total_return_pct": (state.equity / self.config.starting_equity - 1) * 100
                     if self.config.starting_equity
                     else 0.0,
                 },
-                "blocks": blocks,
+                "blocks": buy_blocks(state, self.paused),
                 "positions": [
                     p.to_dict(self._price_of(p.symbol, p.entry_price)) for p in self.positions
                 ],
-                "scan": self._scan_rows,
-                "brain": self.brain.stats(),
+                "coins": self.coins(),
+                "decided_day": self.store.get("decided_day"),
+                "next_decision_at": self.next_decision_at(),
             }
         )
 
     def broadcast(self) -> None:
         bus.publish("state", self.snapshot())
-
-
-def _label(setup: str) -> str:
-    return {
-        "TREND_PULLBACK": "trend pullback",
-        "SQUEEZE_BREAKOUT": "squeeze breakout",
-        "CAPITULATION_REVERSAL": "capitulation reversal",
-    }.get(setup, setup.lower())

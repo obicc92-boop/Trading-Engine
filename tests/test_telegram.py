@@ -1,8 +1,8 @@
 """Notifications and remote control.
 
 Nothing here touches the network. The two properties that matter: the trading loop can
-never be blocked or broken by Telegram, and the command surface cannot be used to open a
-position or loosen a limit.
+never be blocked or broken by Telegram, and the command surface cannot be used to buy or
+loosen a limit.
 """
 
 import queue
@@ -10,10 +10,10 @@ import re
 
 import pytest
 
-from helm.config import Config
-from helm.engine import Engine
-from helm.models import now_ms
+from helm import doctrine
+from helm.engine import COMMANDS
 from helm.notify.telegram import ALERT_LEVELS, TelegramNotifier
+from tests.support import UP, build_engine
 
 
 @pytest.fixture
@@ -25,12 +25,9 @@ def notifier():
 
 
 @pytest.fixture
-def engine(tmp_path):
-    config = Config()
-    config.db_path = str(tmp_path / "tg.db")
-    config.venue = "synthetic"
-    engine = Engine(config)
-    engine.refresh_prices()
+def engine(tmp_path, market):
+    engine = build_engine(str(tmp_path / "tg.db"), market)
+    engine.market_ = market
     return engine
 
 
@@ -184,15 +181,39 @@ def test_a_refused_poll_backs_off_and_says_why(notifier, caplog):
 
 # -- the command surface is deliberately narrow ------------------------------------------
 
-def test_no_command_can_open_a_position_or_loosen_a_limit(engine):
+def test_no_command_can_buy_or_loosen_a_limit(engine):
     """The bot can stop this system. It must not be able to aim it."""
     commands = set(engine._telegram_handlers())
     for forbidden in ("buy", "enter", "trade", "risk", "size", "confirm_entry", "withdraw"):
         assert forbidden not in commands
     assert commands == {
-        "status", "positions", "today", "pause", "resume",
+        "status", "positions", "trades", "pause", "resume",
         "flatten", "kill", "confirm", "help", "start",
     }
+
+
+def test_the_menu_lists_exactly_the_commands_answered(engine):
+    """The menu is registered from the code, so it cannot promise a command that is gone."""
+    assert set(COMMANDS) == set(engine._telegram_handlers()) - {"start"}
+
+
+def test_starting_registers_the_menu(notifier):
+    posted = []
+    notifier._client.post = lambda url, json=None, **_: posted.append((url, json))
+    notifier._client.get = lambda *a, **k: type("R", (), {"json": lambda self: {"result": []}})()
+    notifier._poll = lambda: None
+    notifier.start({"status": lambda: "ok"}, menu={"status": "How it is going"})
+    notifier.stop()
+    menus = [body for url, body in posted if url.endswith("/setMyCommands")]
+    assert menus == [{"commands": [{"command": "status", "description": "How it is going"}]}]
+
+
+def test_status_reads_out_every_coin_against_its_average(engine):
+    engine.cycle()
+    reply = engine._telegram_handlers()["status"]()
+    for symbol in doctrine.SYMBOLS:
+        assert symbol[:-3] in reply
+    assert "Next decision" in reply
 
 
 # -- destructive commands need confirmation ----------------------------------------------
@@ -213,11 +234,11 @@ def test_confirm_does_nothing_on_its_own(engine):
     assert "Nothing waiting" in engine._telegram_handlers()["confirm"]()
 
 
-def test_a_stale_confirmation_is_refused(engine):
+def test_a_stale_confirmation_is_refused(engine, clock):
     approve_and_open(engine)
     handlers = engine._telegram_handlers()
     handlers["flatten"]()
-    engine._pending_command = ("flatten", now_ms() - 1)      # expired
+    engine._pending_command = ("flatten", clock.now() - 1)   # expired
     assert "expired" in handlers["confirm"]()
     assert len(engine.positions) == 1
 
@@ -243,48 +264,18 @@ def test_resume_refuses_while_halted(engine):
     assert engine.halted
 
 
-# -- daily digest ------------------------------------------------------------------------
-
-def test_first_boot_sends_no_digest(engine):
-    sent = []
-    engine.notifier.notify = lambda message, level="info": sent.append(message)
-    engine.maybe_send_digest()
-    assert sent == []
-
-
-def test_digest_is_sent_once_per_day(engine):
-    sent = []
-    engine.notifier.notify = lambda message, level="info": sent.append(message)
-    engine.maybe_send_digest()                  # records today, sends nothing
-    engine.store.put("last_digest_day", "2020-01-01")
-
-    engine.maybe_send_digest()
-    engine.maybe_send_digest()                  # same day again
-    assert len(sent) == 1
-
-
-def test_a_quiet_day_still_reports(engine):
-    """Silence is ambiguous — a system that only speaks when it trades looks dead."""
-    sent = []
-    engine.notifier.notify = lambda message, level="info": sent.append(message)
-    engine.store.put("last_digest_day", "2020-01-01")
-    engine.maybe_send_digest()
-    assert "No trades" in sent[0]
-    assert "Equity" in sent[0]
-
-
 # -- orphan detection --------------------------------------------------------------------
 
 def test_holdings_with_no_plan_are_reported_once(engine):
-    """The symptom of a lost database: coins on the exchange with no stop attached."""
+    """The symptom of a lost database: coins on the exchange with no record of buying them."""
     alerts = []
     engine.narrate = lambda message, level="info": alerts.append((level, message))
 
-    engine.broker._balances["BTC"] = 0.002
+    engine.broker._balances["BTC"] = 0.5          # ~50 EUR
     engine.reconcile()
     assert len(alerts) == 1
     assert alerts[0][0] == "error"
-    assert "NO STOP" in alerts[0][1]
+    assert "no record" in alerts[0][1]
 
     alerts.clear()
     engine.reconcile()
@@ -310,18 +301,7 @@ def test_a_managed_position_is_not_an_orphan(engine):
 # -- helpers -----------------------------------------------------------------------------
 
 def approve_and_open(engine) -> None:
-    from helm.models import Analysis, Candidate, Verdict
-
-    symbol = "BTCEUR"
-    price = engine._prices[symbol]
-    analysis = Analysis(symbol=symbol, price=price, regime="TRENDING_UP",
-                        indicators={"atr": price * 0.01, "swing_low": price * 0.97,
-                                    "ema21": price * 0.99, "rsi": 55.0})
-    engine._analysis[symbol] = analysis
-    candidate = Candidate(symbol=symbol, setup="TREND_PULLBACK", score=75.0, factors={},
-                          price=price, stop=price * 0.96, target=price * 1.12,
-                          regime="TRENDING_UP", analysis=analysis, rationale=["test"])
-    engine.brain.judge_entry = lambda *a, **k: Verdict(
-        go=True, conviction=70, size_multiplier=1.0, stop_override=None,
-        thesis="Test.", invalidation="Test.", source="stub")
-    engine._consider(candidate, engine.account_state())
+    """Let the rule buy BTC: its close above the average, and a decision to read it."""
+    engine.market_.set_close("BTCEUR", UP)
+    engine.cycle()
+    assert [position.symbol for position in engine.positions] == ["BTCEUR"]
